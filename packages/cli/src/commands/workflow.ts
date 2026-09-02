@@ -1607,7 +1607,7 @@ async function runWorkflowWithOwnedSource(
   // Pinned at the moment of prepare so the SIGINT/SIGTERM cleanup never rm's a
   // path a live run is reading from. For `--container` folder-codebase runs,
   // `finalizeWorkflowSource` (workflow.ts:1749) reassigns `preparedSource` to a
-  // new object whose anchor points at the LIVE artifacts directory the run
+  // new object whose anchor points at the LIVE source directory the run
   // executes from — rm-ing `preparedSource.anchor.root` on Ctrl-C mid-run would
   // destroy the run's source. The original staged path is renamed away by
   // either `finalizeWorkflowSource` (container) or `executeWorkflow`'s rename
@@ -3010,7 +3010,7 @@ async function runWorkflowWithOwnedSource(
       // The rm targets the ORIGINAL staged path pinned at prepare time, not
       // `preparedSource.anchor.root` (see `originalStagedRoot`'s note above).
       // For container runs that path was renamed away by `finalizeWorkflowSource`
-      // and `preparedSource.anchor.root` is now the LIVE artifacts directory —
+      // and `preparedSource.anchor.root` is now the LIVE source directory —
       // rm-ing it mid-execution would destroy the run's source.
       .then(async () => {
         if (originalStagedRoot) {

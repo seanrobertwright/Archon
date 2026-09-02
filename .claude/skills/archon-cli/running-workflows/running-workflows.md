@@ -17,7 +17,7 @@ The live list is authoritative. Bundled workflows ship under the `archon-` prefi
 claim any name and override a bundled one in that repo.
 
 In JSON output, `descriptionTruncated: true` means `description` is a discovery preview,
-not the complete routing contract. Human output marks the same state with ` [truncated]`.
+not the complete routing contract. Human output marks the same state with `[truncated]`.
 Use the previews to identify plausible candidates, then run `archon workflow list <name>
 --full` for each candidate before choosing or launching. Map intent from those full
 descriptions — never from memory of names you have seen elsewhere. If two names plausibly

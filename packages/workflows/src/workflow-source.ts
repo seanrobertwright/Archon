@@ -728,11 +728,6 @@ export async function assertWorkflowSourceIntegrity(roots: WorkflowSourceRoots):
   await loadWorkflowSource(roots.anchor.root, roots.anchor.digest, roots.anchor.config);
 }
 
-/** Canonical location of a run's captured source, under that run's artifacts. */
-export function getRunSourceCapturePath(artifactsDir: string): string {
-  return join(artifactsDir, 'workflow-source');
-}
-
 /**
  * The verified capture a run recorded at start, manifest included.
  *

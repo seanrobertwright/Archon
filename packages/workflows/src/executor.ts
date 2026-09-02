@@ -46,7 +46,6 @@ import {
   WorkflowSourceIntegrityError,
   captureWorkflowSource,
   capturedSourceRoots,
-  getRunSourceCapturePath,
   recordSelectedWorkflow,
   resolveRunSourceCapture,
   resolveChildDiscoveryRoot,
@@ -355,9 +354,11 @@ async function isFolderCodebase(
   }
 }
 
-/** The four run-scoped output directories plus the project root they hang off. */
+/** The run-scoped output directories plus the project root they hang off. */
 export interface ResolvedProjectPaths {
   artifactsDir: string;
+  /** Where this run's frozen workflow source lives — beside `artifactsDir`, never inside it. */
+  workflowSourceDir: string;
   logDir: string;
   artifactsRoot: string;
   /** `$STATE_DIR` — per-PROJECT cross-run state, shared by every workflow. */
@@ -513,6 +514,7 @@ function composeRunPaths(
 ): ResolvedProjectPaths {
   return {
     artifactsDir: archonPaths.getRunArtifactsDirForRoot(storage.root, workflowRunId),
+    workflowSourceDir: archonPaths.getRunWorkflowSourceDirForRoot(storage.root, workflowRunId),
     logDir: storage.logsDir,
     artifactsRoot: storage.artifactsRoot,
     stateDir: storage.stateRoot,
@@ -721,7 +723,7 @@ export type ExecuteWorkflowOptions = ResumePayload & {
  * A capture taken BEFORE its workflow was selected, with the run id it is filed under.
  *
  * The reserved id is what makes the ordering possible: the capture has to live at the
- * run's own artifacts path so a container can bind it and cleanup can reclaim it, but it
+ * run's own source path so a container can bind it and cleanup can reclaim it, but it
  * has to exist before discovery — and therefore before the run row. Reserving the id up
  * front is cheaper than inventing a second staging lifecycle for the gap.
  *
@@ -821,7 +823,7 @@ export interface CapturedSourceOwner {
    * A run now owns the bytes and their lifetime; stop tracking them. Called by the
    * caller from `executeWorkflow`'s rename success site (via
    * `ExecuteWorkflowOptions.capturedSourceOwner`) once the staged capture has been moved
-   * under the run's artifacts directory. Earlier call sites — before the rename — could
+   * to the run's own source path. Earlier call sites — before the rename — could
    * leave the staged directory orphaned when the rename itself failed (#2690); adoption
    * at the rename site means a failed move leaves the wrap's `finally` to reclaim.
    */
@@ -932,7 +934,7 @@ export async function disposeWorkflowSource(prepared: { captureRoot: string }): 
 }
 
 /**
- * Move a staged capture to its final home under the run's artifacts, early.
+ * Move a staged capture to its final home, early.
  *
  * `executeWorkflow` normally does this itself once it has resolved the run's paths. One
  * caller cannot wait: a container fixes its bind mounts at `docker run`, which happens
@@ -947,13 +949,12 @@ export async function finalizeWorkflowSource(
   prepared: PreparedWorkflowSource,
   opts: { cwd: string; codebaseId?: string }
 ): Promise<PreparedWorkflowSource> {
-  const { artifactsDir } = await resolveProjectPaths(
+  const { workflowSourceDir: finalRoot } = await resolveProjectPaths(
     deps,
     opts.cwd,
     prepared.runId,
     opts.codebaseId
   );
-  const finalRoot = getRunSourceCapturePath(artifactsDir);
   if (finalRoot === prepared.anchor.root) return prepared;
   await mkdir(dirname(finalRoot), { recursive: true });
   await rm(finalRoot, { recursive: true, force: true });
@@ -1011,11 +1012,11 @@ export async function prepareWorkflowSource(
   }
   await sweepStaleStagedSources();
   const runId = opts.runId ?? randomUUID();
-  // Staged, not final. The run's artifacts path depends on its registered project
+  // Staged, not final. The run's source path depends on its registered project
   // identity, which the caller often has not resolved yet at capture time — and looking
   // it up early would duplicate a lookup the run does properly later. Staging under
   // ARCHON_HOME keeps the capture on the same filesystem, so `executeWorkflow` moves it
-  // into `<artifactsDir>/workflow-source` with a rename once the real path is known. The
+  // to `<workflow-source>/runs/<id>` with a rename once the real path is known. The
   // bytes never change, so the digest taken here still describes the final capture.
   const capture = await captureWorkflowSource({
     sourceRoot: opts.sourceRoot,
@@ -2404,10 +2405,17 @@ export async function executeWorkflow(
 
   // Resolve external artifact, log, and state directories. A resumed run
   // carries its `output_root` and short-circuits identity resolution entirely.
-  const { artifactsDir, logDir, artifactsRoot, stateDir, outputRoot, identityResolution } =
-    await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId, {
-      persistedOutputRoot: workflowRun.output_root,
-    });
+  const {
+    artifactsDir,
+    workflowSourceDir,
+    logDir,
+    artifactsRoot,
+    stateDir,
+    outputRoot,
+    identityResolution,
+  } = await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId, {
+    persistedOutputRoot: workflowRun.output_root,
+  });
 
   // Record the resolved root ONCE, so every later reader (artifact routes, CLI)
   // addresses this run's output by a durable pointer instead of re-deriving it
@@ -2678,17 +2686,21 @@ export async function executeWorkflow(
     // discovered from that capture, so the YAML being executed and the commands and
     // scripts beside it are one consistent set of bytes.
     //
-    // Move the staged capture under this run's artifacts, so it lives and dies with the
-    // rest of the run's output instead of accumulating in a staging directory nothing
-    // reclaims. Same filesystem, so this is a rename.
-    const finalCaptureRoot = getRunSourceCapturePath(artifactsDir);
+    // Move the staged capture to this run's own source directory, so it stops
+    // accumulating in a staging directory nothing reclaims. That directory sits BESIDE
+    // the run's artifacts, not inside them: `$ARTIFACTS_DIR` is handed to every node and
+    // listed as the run's output, and the frozen pack is neither an output nor something
+    // a node should reach by that path. Same filesystem, so this is a rename.
+    const finalCaptureRoot = workflowSourceDir;
     try {
       if (preparedSource.anchor.root !== finalCaptureRoot) {
+        // Unlike `artifactsDir`, nothing earlier in the run creates this parent.
+        await mkdir(dirname(finalCaptureRoot), { recursive: true });
         await rm(finalCaptureRoot, { recursive: true, force: true });
         await rename(preparedSource.anchor.root, finalCaptureRoot);
       }
-      // The staged capture is now under the run's artifacts directory — the run owns
-      // the bytes from this point on. Adopting here (not earlier, at the call site) is
+      // The staged capture is now at the run's own source path — the run owns the
+      // bytes from this point on. Adopting here (not earlier, at the call site) is
       // what closes the race in #2690: a rename failure above returns without reaching
       // this line, so the wrap's `finally` reclaims the staged directory instead of
       // leaving it to the hourly age-based sweep.
