@@ -181,6 +181,7 @@ export type NodeState = z.infer<typeof nodeStateSchema>;
 export const skipCauseSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('condition'), expr: z.string() }),
   z.object({ kind: z.literal('condition_parse_error'), expr: z.string() }),
+  z.object({ kind: z.literal('timeout') }),
   z.object({ kind: z.literal('upstream_failed'), origin: z.string() }),
   z.object({ kind: z.literal('upstream_skipped'), origin: z.string() }),
 ]);

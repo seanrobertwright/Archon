@@ -3750,6 +3750,8 @@ export interface components {
       prompt?: string;
       bash?: string;
       timeout?: number;
+      /** @enum {string} */
+      on_timeout?: 'skip';
       loop?: {
         until?: string;
         max_iterations: number;

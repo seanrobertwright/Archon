@@ -121,7 +121,7 @@ type NodeSkippedEvent = NodeSkippedEventBase &
   (
     | { reason: 'prior_success' }
     | {
-        reason: 'when_condition' | 'when_condition_parse_error' | 'trigger_rule';
+        reason: 'when_condition' | 'when_condition_parse_error' | 'trigger_rule' | 'timeout';
         cause: SkipCause;
       }
   );

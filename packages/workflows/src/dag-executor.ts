@@ -3356,9 +3356,15 @@ type RawSubprocessRejection = Error & {
    * `null` on a timeout kill — Node reports that one through `signal` instead.
    */
   code?: number | string | null;
+  /** True when Node killed the child after the configured `execFile` timeout elapsed. */
+  killed?: boolean;
   /** Set (with `code: null`) when the child was killed, which for `execFile` is a timeout. */
   signal?: string | null;
 };
+
+function isSubprocessTimeout(error: RawSubprocessRejection): boolean {
+  return error.killed === true && error.code === null;
+}
 
 const CREDENTIAL_ENV_KEY_SUFFIX = /(?:TOKEN|KEY|SECRET|PASSWORD)$/i;
 const CREDENTIAL_ENV_KEYS = new Set(['DATABASE_URL']);
@@ -3654,6 +3660,48 @@ async function rejectedArtifactPointer(run: WorkflowRun, value: unknown): Promis
  * diagnostic and, worse, read a stdout excerpt containing "timed out" as a timeout.
  */
 class ExecOutputContractError extends Error {}
+
+async function recordExecTimeoutSkip(
+  ctx: RunLayersContext,
+  node: ExecNode,
+  nodeType: 'bash' | 'script',
+  stepName: string,
+  iterationData: { iteration?: number }
+): Promise<NodeOutput> {
+  const cause: SkipCause = { kind: 'timeout' };
+  getLog().info({ nodeId: node.id, nodeType }, 'dag_node_skipped_timeout');
+  await logNodeSkip(ctx.logDir, ctx.workflowRun.id, node.id, 'timeout').catch((err: Error) => {
+    getLog().error(
+      { err, workflowRunId: ctx.workflowRun.id, nodeId: node.id },
+      'dag.node_skip_log_failed'
+    );
+  });
+
+  ctx.deps.store
+    .createWorkflowEvent({
+      workflow_run_id: ctx.workflowRun.id,
+      event_type: 'node_skipped',
+      step_name: stepName,
+      data: { reason: 'timeout', cause, type: nodeType, ...iterationData },
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: ctx.workflowRun.id, eventType: 'node_skipped' },
+        'workflow_event_persist_failed'
+      );
+    });
+
+  getWorkflowEventEmitter().emit({
+    type: 'node_skipped',
+    runId: ctx.workflowRun.id,
+    nodeId: node.id,
+    nodeName: node.id,
+    reason: 'timeout',
+    cause,
+  });
+
+  return { state: 'skipped', output: '', cause };
+}
 
 /** How much of the offending stdout a contract failure quotes back to the author. */
 const EXEC_CONTRACT_STDOUT_PREVIEW = 200;
@@ -3963,13 +4011,14 @@ async function executeBashNode(
         : {}),
     };
   } catch (error) {
-    const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
+    const err = error as RawSubprocessRejection;
     // A contract failure (#2453) is Archon's own diagnosis of stdout, not a subprocess
-    // diagnostic: it is reported verbatim and must not be read as a timeout because the
-    // quoted stdout happens to contain that phrase.
+    // rejection. Report it verbatim and keep it outside subprocess classification.
     const contractFailure = error instanceof ExecOutputContractError;
-    const isTimeout =
-      !contractFailure && (err.killed === true || (err.message ?? '').includes('timed out'));
+    const isTimeout = !contractFailure && isSubprocessTimeout(err);
+    if (isTimeout && node.on_timeout === 'skip') {
+      return recordExecTimeoutSkip(ctx, node, 'bash', stepName, iterationData);
+    }
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in — the timeout message also contains the
@@ -4395,12 +4444,13 @@ async function executeScriptNode(
         : {}),
     };
   } catch (error) {
-    const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
-    // See executeBashNode: a contract failure (#2453) is reported verbatim and is never a
-    // timeout, however the quoted stdout reads.
+    const err = error as RawSubprocessRejection;
+    // See executeBashNode: a contract failure (#2453) stays outside subprocess classification.
     const contractFailure = error instanceof ExecOutputContractError;
-    const isTimeout =
-      !contractFailure && (err.killed === true || (err.message ?? '').includes('timed out'));
+    const isTimeout = !contractFailure && isSubprocessTimeout(err);
+    if (isTimeout && node.on_timeout === 'skip') {
+      return recordExecTimeoutSkip(ctx, node, 'script', stepName, iterationData);
+    }
     const label = `Script node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in — the timeout message also contains the

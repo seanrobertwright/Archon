@@ -3496,6 +3496,8 @@ function formatSkipCause(cause: SkipCause): string {
       return `condition: ${cause.expr}`;
     case 'condition_parse_error':
       return `condition parse error: ${cause.expr}`;
+    case 'timeout':
+      return 'timeout';
     case 'upstream_failed':
       return `upstream failed: ${cause.origin}`;
     case 'upstream_skipped':

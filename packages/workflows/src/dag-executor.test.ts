@@ -17270,7 +17270,7 @@ describe('executeDagWorkflow -- script nodes', () => {
     expect(errorMsg).toContain('[eval]');
   });
 
-  it('timeout kills subprocess', async () => {
+  it('fails by default when the subprocess times out', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('script-timeout-run-id', {
@@ -17298,6 +17298,18 @@ describe('executeDagWorkflow -- script nodes', () => {
         workflowRun,
       })
     );
+
+    const events = mockDeps.store.createWorkflowEvent.mock.calls.map(
+      ([event]) =>
+        event as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+    );
+    const failed = events.find(
+      event => event.event_type === 'node_failed' && event.step_name === 'slow-script'
+    );
+    expect(failed?.data?.error).toBe("Script node 'slow-script' timed out after 500ms");
+    expect(
+      events.some(event => event.event_type === 'node_skipped' && event.step_name === 'slow-script')
+    ).toBe(false);
 
     const sendMessage = platform.sendMessage as ReturnType<typeof mock>;
     const messages = sendMessage.mock.calls.map((call: unknown[]) => call[1] as string);
@@ -17720,6 +17732,112 @@ describe('parseMcpFailureServerNames', () => {
       { name: 'a', segment: 'a (x)' },
       { name: 'b', segment: 'b (y)' },
     ]);
+  });
+});
+
+describe('executeDagWorkflow -- exec timeout outcomes', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-exec-timeout-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await removeTempTree(testDir);
+  });
+
+  it.each([
+    ['bash', { id: 'slow', bash: 'sleep 30', timeout: 100, on_timeout: 'skip' }],
+    [
+      'script',
+      {
+        id: 'slow',
+        script: 'await Bun.sleep(30_000)',
+        runtime: 'bun',
+        timeout: 100,
+        on_timeout: 'skip',
+      },
+    ],
+  ] as const)(
+    'skips an opted-in %s timeout and resolves a downstream if_skipped binding',
+    async (kind, producerInput) => {
+      const store = createMockStore();
+      const consumer = dagNodeSchema.parse({
+        id: 'consumer',
+        script: 'console.log(process.env.INPUTS_VALUE)',
+        runtime: 'bun',
+        depends_on: ['slow'],
+        trigger_rule: 'all_done',
+        with: { value: { from: '$slow.output', if_skipped: 'fallback' } },
+      });
+
+      await executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(store),
+          cwd: testDir,
+          workflowRun: makeWorkflowRun(`exec-timeout-${kind}`),
+          workflow: {
+            name: `exec-timeout-${kind}`,
+            nodes: [dagNodeSchema.parse(producerInput), consumer],
+          },
+        })
+      );
+
+      const events = store.createWorkflowEvent.mock.calls.map(
+        ([event]) =>
+          event as {
+            event_type: string;
+            step_name?: string;
+            data?: Record<string, unknown>;
+          }
+      );
+      const skipped = events.find(
+        event => event.event_type === 'node_skipped' && event.step_name === 'slow'
+      );
+      const completed = events.find(
+        event => event.event_type === 'node_completed' && event.step_name === 'consumer'
+      );
+
+      expect(skipped?.data).toMatchObject({
+        reason: 'timeout',
+        cause: { kind: 'timeout' },
+        type: kind,
+      });
+      expect(completed?.data?.node_output).toBe('fallback');
+      expect(events.some(event => event.event_type === 'node_failed')).toBe(false);
+      expect(store.completeWorkflowRun).toHaveBeenCalled();
+    },
+    10000
+  );
+
+  it('does not misclassify a non-timeout failure whose diagnostic mentions a timeout', async () => {
+    const store = createMockStore();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflowRun: makeWorkflowRun('exec-timeout-lookalike'),
+        workflow: {
+          name: 'exec-timeout-lookalike',
+          nodes: [
+            dagNodeSchema.parse({
+              id: 'failed',
+              bash: 'echo "timed out" >&2; exit 1',
+              on_timeout: 'skip',
+            }),
+          ],
+        },
+      })
+    );
+
+    const events = store.createWorkflowEvent.mock.calls.map(([event]) => event);
+    expect(events.some(event => event.event_type === 'node_failed')).toBe(true);
+    expect(events.some(event => event.event_type === 'node_skipped')).toBe(false);
   });
 });
 
@@ -29986,8 +30104,6 @@ describe('exec result contracts (#2453)', () => {
   });
 
   it('a stdout excerpt that mentions a timeout is still reported as a contract failure', async () => {
-    // The exec catch reads `err.message.includes('timed out')` to detect a killed
-    // subprocess; a contract failure quotes stdout back, so it must not be misread.
     const events = await runDag(
       contractWorkflow(bashEmitting('the job timed out')),
       'contract-timeout-lookalike'

@@ -132,6 +132,23 @@ describe('buildNodeSummaries', () => {
     ]);
   });
 
+  it('retains a timeout skip cause', () => {
+    const summaries = buildNodeSummaries([
+      event('timeout-skip', 'node_skipped', 'ci-note', '2026-08-29T14:30:00.000Z', {
+        reason: 'timeout',
+        cause: { kind: 'timeout' },
+      }),
+    ]);
+
+    expect(summaries).toEqual([
+      {
+        nodeId: 'ci-note',
+        state: 'skipped',
+        cause: { kind: 'timeout' },
+      },
+    ]);
+  });
+
   it('keeps legacy skipped rows without a cause readable', () => {
     const summaries = buildNodeSummaries([
       event('legacy-skip', 'node_skipped', 'legacy', '2026-08-29T14:30:00.000Z', {

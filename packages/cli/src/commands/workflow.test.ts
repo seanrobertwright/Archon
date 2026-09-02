@@ -5081,6 +5081,35 @@ describe('workflowGetCommand', () => {
     expect(consoleSpy).toHaveBeenCalledWith('    - publish (upstream failed: validate)');
   });
 
+  it('renders a persisted timeout skip cause in workflow get', async () => {
+    const workflowDb = await import('@archon/core/db/workflows');
+    const workflowEventsDb = await import('@archon/core/db/workflow-events');
+
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'run-timeout-skip',
+      workflow_name: 'deliver',
+      working_path: '/repo',
+      status: 'completed',
+      started_at: new Date(),
+      metadata: {},
+    });
+    (workflowEventsDb.listWorkflowEvents as ReturnType<typeof mock>).mockResolvedValueOnce([
+      {
+        id: 'timeout-skip-event',
+        workflow_run_id: 'run-timeout-skip',
+        event_type: 'node_skipped',
+        step_name: 'ci-note',
+        step_index: 1,
+        data: { reason: 'timeout', cause: { kind: 'timeout' } },
+        created_at: new Date().toISOString(),
+      },
+    ]);
+
+    await workflowGetCommand('run-timeout-skip', false, true);
+
+    expect(consoleSpy).toHaveBeenCalledWith('    - ci-note (timeout)');
+  });
+
   it('emits {ok:false} JSON (never throws) when the DB lookup fails', async () => {
     const workflowDb = await import('@archon/core/db/workflows');
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
@@ -10315,6 +10344,29 @@ describe('workflowRunCommand — progress rendering', () => {
     expect(stderrSpy).toHaveBeenCalledWith(
       '[deploy] Skipped (condition: $classify.output == deploy)\n'
     );
+  });
+
+  it('should render a timeout node_skipped event to stderr', async () => {
+    setupWorkflowMocks();
+
+    const { executeWorkflow } = require('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockImplementationOnce(async () => {
+      if (capturedSubscribeHandler) {
+        capturedSubscribeHandler({
+          type: 'node_skipped',
+          runId: 'run-1',
+          nodeId: 'ci-note',
+          nodeName: 'ci-note',
+          reason: 'timeout',
+          cause: { kind: 'timeout' },
+        });
+      }
+      return { success: true, workflowRunId: 'run-1' };
+    });
+
+    await workflowRunCommand('/test/path', 'plan', 'hello', {});
+
+    expect(stderrSpy).toHaveBeenCalledWith('[ci-note] Skipped (timeout)\n');
   });
 
   it('should write approval_pending event to stderr', async () => {
