@@ -31,7 +31,6 @@ import {
   parseWholeInputsRef,
   OUTPUT_REF_SOURCE,
   INPUT_NAME_SOURCE,
-  type JsonValue,
 } from '../output-ref';
 import {
   BASE_COMPLETION_CHANNELS,
@@ -299,6 +298,8 @@ export const bindingDirectiveSchema = z.strictObject({
 
 export type BindingDirective = z.infer<typeof bindingDirectiveSchema>;
 
+const nodeBindingsSchema = z.record(z.string(), z.union([jsonValueSchema, bindingDirectiveSchema]));
+
 /**
  * Runtime guard for a command/script `with:` value: loader-validated maps only ever
  * hold a directive in object position, but programmatic definitions bypass the
@@ -331,7 +332,7 @@ export const promptSourceSchema = z.discriminatedUnion('kind', [
     // `$INPUTS.<name>` surface. Strings may hold refs/templates; a whole
     // `$node.output[.field]` ref passes the logical value; objects are binding
     // directives ({ from, if_skipped }) — validated in dagNodeSchema's superRefine.
-    with: z.record(z.string(), z.union([jsonValueSchema, bindingDirectiveSchema])).optional(),
+    with: nodeBindingsSchema.optional(),
   }),
 ]);
 
@@ -383,26 +384,25 @@ export type AgentNode = z.infer<typeof agentNodeSchema>;
  * drift, not evidence for merging — they're filed as their own fixes, #2725 and
  * #2726, rather than folded into this call.
  */
+const execScriptInputSchema = z.string();
+const execTimeoutInputSchema = z.number();
+
 export const execNodeSchema = dagNodeBaseSchema.extend({
   kind: z.literal('exec'),
-  script: z
-    .string()
-    .trim()
-    .min(1, {
-      error: issue =>
-        issue.path?.at(-1) === 'bash' ? 'bash script cannot be empty' : 'script cannot be empty',
-    }),
+  script: execScriptInputSchema.trim().min(1, {
+    error: issue =>
+      issue.path?.at(-1) === 'bash' ? 'bash script cannot be empty' : 'script cannot be empty',
+  }),
   runtime: z.enum(['sh', 'bun', 'uv']),
   deps: z.array(z.string().min(1, 'each dep must be a non-empty string')).optional(),
-  timeout: z
-    .number()
+  timeout: execTimeoutInputSchema
     .positive("'timeout' must be a positive number (ms)")
     .finite("'timeout' must be a positive number (ms)")
     .optional(),
   // Node-local named bindings (#2637): delivered as INPUTS_<UPPER_SNAKE> env vars.
   // Same value grammar as an agent node's command-sourced `with:`. Only meaningful
   // (and only ever populated) when `runtime !== 'sh'`.
-  with: z.record(z.string(), z.union([jsonValueSchema, bindingDirectiveSchema])).optional(),
+  with: nodeBindingsSchema.optional(),
 });
 
 /** DAG node that runs a shell script, or a TypeScript/Python script via bun or uv, without AI */
@@ -424,6 +424,20 @@ const scriptExecAuthoringSchema = execNodeSchema
   .extend({
     runtime: execNodeSchema.shape.runtime.exclude(['sh']),
   });
+
+// The flat schema must accept legacy ignored values until a node mode is known.
+// Selected bash/script nodes are validated against the strict projections in
+// dagNodeSchema; other modes keep dropping these fields as they did before.
+const bashExecFlatSchema = bashExecAuthoringSchema.extend({
+  bash: execScriptInputSchema,
+  timeout: execTimeoutInputSchema.optional(),
+} satisfies Partial<Record<keyof typeof bashExecAuthoringSchema.shape, z.ZodType>>);
+
+const scriptExecFlatSchema = scriptExecAuthoringSchema.extend({
+  script: execScriptInputSchema,
+  timeout: execTimeoutInputSchema.optional(),
+  with: z.unknown().optional(),
+} satisfies Partial<Record<keyof typeof scriptExecAuthoringSchema.shape, z.ZodType>>);
 
 type BashExecAuthoring = z.infer<typeof bashExecAuthoringSchema>;
 type ScriptExecAuthoring = z.infer<typeof scriptExecAuthoringSchema>;
@@ -1070,7 +1084,7 @@ export const dagNodeFlatSchema = dagNodeBaseSchema.extend({
   // Mode fields (exactly one required)
   command: z.string().optional(),
   prompt: z.string().optional(),
-  ...bashExecAuthoringSchema.partial().shape,
+  ...bashExecFlatSchema.partial().shape,
   loop: loopNodeConfigSchema.optional(),
   loop_group: loopGroupNodeConfigSchema.optional(),
   approval: approvalConfigSchema.optional(),
@@ -1091,10 +1105,7 @@ export const dagNodeFlatSchema = dagNodeBaseSchema.extend({
   // `workflow:` node it multiplies child runs (#2121 slice 2); on an `include:` node it
   // multiplies the composed body inside this run (#2512). Guarded in superRefine.
   fan_out: fanOutConfigSchema.optional(),
-  // `bash:` and `script:` are authored projections of the resolved ExecNode contract.
-  // The projection keeps the authored runtime vocabulary narrower: shell execution is
-  // selected by `bash:`, while `script:` admits only the non-shell runtimes.
-  ...scriptExecAuthoringSchema.partial().shape,
+  ...scriptExecFlatSchema.partial().shape,
 });
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1145,17 @@ export const dagNodeSchema = z
   .preprocess(rejectRetiredThinking, dagNodeFlatSchema)
   .superRefine((data, ctx) => {
     const id = data.id.trim();
+    const addSchemaIssues = (
+      issues: readonly { message: string; path?: readonly PropertyKey[] }[]
+    ): void => {
+      for (const issue of issues) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: issue.message,
+          ...(issue.path !== undefined ? { path: [...issue.path] } : {}),
+        });
+      }
+    };
 
     // id must be non-empty
     if (!id) {
@@ -1185,6 +1207,32 @@ export const dagNodeSchema = z
           "'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'wait', 'cancel', 'script', 'include', and 'workflow' are mutually exclusive",
       });
       return z.NEVER;
+    }
+
+    const bashAuthoring = hasBash ? bashExecAuthoringSchema.partial().safeParse(data) : undefined;
+    if (bashAuthoring && !bashAuthoring.success) {
+      addSchemaIssues(bashAuthoring.error.issues);
+    }
+
+    const scriptAuthoring = hasScript
+      ? scriptExecAuthoringSchema.partial().safeParse(data)
+      : undefined;
+    if (scriptAuthoring && !scriptAuthoring.success) {
+      for (const issue of scriptAuthoring.error.issues) {
+        if (issue.path[0] === 'with') {
+          const key = issue.path.at(1);
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message:
+              typeof key === 'string'
+                ? `script input '${key}' must be a JSON-compatible value (string, number, boolean, null, array, or object)`
+                : "'with' on script nodes must be an object mapping input names to values",
+            path: ['with'],
+          });
+        } else {
+          addSchemaIssues([issue]);
+        }
+      }
     }
 
     // 'decisions' (#2707 step 1, the new authoring surface) and 'on_reject' (the
@@ -1240,17 +1288,41 @@ export const dagNodeSchema = z
     // `with:` is an identifier-keyed JSON-value map on include and workflow nodes
     // (#2470, values widened from string-only in #2637). For includes it inlines at
     // load time (applyInputsMacro); for sub-runs it becomes `$INPUTS.<name>` runtime
-    // variables on the child. Its value type comes from the ExecNode projection above;
-    // mode-specific key and binding-directive rules remain contextual here.
+    // variables on the child. The flat field remains unknown until a mode is selected,
+    // so node types that historically ignored `with:` keep accepting and dropping it.
     const validateWithShape = (
       kind: 'include' | 'workflow' | 'command' | 'script'
-    ): NonNullable<typeof data.with> => {
-      const map = data.with ?? {};
-      for (const key of Object.keys(map)) {
+    ): Record<string, unknown> | undefined => {
+      const prototype =
+        typeof data.with === 'object' && data.with !== null
+          ? Object.getPrototypeOf(data.with)
+          : undefined;
+      if (
+        typeof data.with !== 'object' ||
+        data.with === null ||
+        Array.isArray(data.with) ||
+        (prototype !== Object.prototype && prototype !== null)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `'with' on ${kind} nodes must be an object mapping input names to values`,
+          path: ['with'],
+        });
+        return undefined;
+      }
+      const map = data.with as Record<string, unknown>;
+      for (const [key, value] of Object.entries(map)) {
         if (!INPUT_NAME_PATTERN.test(key)) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             message: `invalid ${kind} input name '${key}'; use letters, numbers, underscores, or hyphens and start with a letter or underscore`,
+            path: ['with'],
+          });
+        }
+        if (!jsonValueSchema.safeParse(value).success) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `${kind} input '${key}' must be a JSON-compatible value (string, number, boolean, null, array, or object)`,
             path: ['with'],
           });
         }
@@ -1260,9 +1332,10 @@ export const dagNodeSchema = z
     // Node-local bindings on command/script nodes (#2637): same key/value grammar as
     // include/workflow `with:`, plus the object position is RESERVED for the binding
     // directive — any other object shape is rejected naming both accepted forms.
-    const validateNodeBindings = (kind: 'command' | 'script'): void => {
-      const map = validateWithShape(kind);
-      if (map === undefined) return;
+    const validateNodeBindings = (
+      kind: 'command' | 'script',
+      map: Record<string, unknown>
+    ): void => {
       // Two names folding to one INPUTS_<UPPER_SNAKE> env key would silently clobber
       // each other on script env delivery — same rule the loader enforces for a
       // workflow's declared `inputs:` block, applied here where the map is visible.
@@ -1313,8 +1386,13 @@ export const dagNodeSchema = z
     };
     if (hasInclude && data.with !== undefined) validateWithShape('include');
     if (hasWorkflow && data.with !== undefined) validateWithShape('workflow');
-    if (hasCommand && data.with !== undefined) validateNodeBindings('command');
-    if (hasScript && data.with !== undefined) validateNodeBindings('script');
+    if (hasCommand && data.with !== undefined) {
+      const bindings = validateWithShape('command');
+      if (bindings !== undefined) validateNodeBindings('command', bindings);
+    }
+    if (scriptAuthoring?.success && scriptAuthoring.data.with !== undefined) {
+      validateNodeBindings('script', scriptAuthoring.data.with);
+    }
     // A `workflow:` node has ONE input channel per invocation: either the untyped
     // `input:` string ($ARGUMENTS) or the named `with:` map ($INPUTS.<name>). Accepting
     // both would require a precedence rule between two overlapping channels — the exact
@@ -1448,12 +1526,26 @@ export const dagNodeSchema = z
     }
 
     if (modeCount === 0) {
+      if (typeof data.bash === 'string') {
+        const result = bashExecAuthoringSchema.pick({ bash: true }).safeParse(data);
+        if (!result.success) {
+          addSchemaIssues(result.error.issues);
+        }
+        return z.NEVER;
+      }
       if (typeof data.prompt === 'string') {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: 'prompt cannot be empty',
           path: ['prompt'],
         });
+        return z.NEVER;
+      }
+      if (typeof data.script === 'string') {
+        const result = scriptExecAuthoringSchema.pick({ script: true }).safeParse(data);
+        if (!result.success) {
+          addSchemaIssues(result.error.issues);
+        }
         return z.NEVER;
       }
       ctx.addIssue({
@@ -1651,10 +1743,6 @@ export const dagNodeSchema = z
       ...(data.persist_session !== undefined ? { persist_session: data.persist_session } : {}),
     };
 
-    // Node-local bindings (#2637) — validated by validateNodeBindings above; carried
-    // only by the command/script variants (other modes keep stripping the field).
-    const nodeBindings = data.with !== undefined ? { with: data.with } : {};
-
     if (data.command !== undefined && data.command.trim().length > 0) {
       return {
         ...base,
@@ -1664,7 +1752,7 @@ export const dagNodeSchema = z
         source: {
           kind: 'command',
           name: data.command.trim(),
-          ...nodeBindings,
+          ...(data.with !== undefined ? { with: nodeBindingsSchema.parse(data.with) } : {}),
         },
       } as AgentNode;
     }
@@ -1753,7 +1841,9 @@ export const dagNodeSchema = z
           ...structuralBase,
           kind: 'compose_fan_out',
           include: data.include.trim(),
-          ...(data.with !== undefined ? { with: data.with as Record<string, JsonValue> } : {}),
+          ...(data.with !== undefined
+            ? { with: composeFanOutNodeSchema.shape.with.unwrap().parse(data.with) }
+            : {}),
           fan_out: data.fan_out,
         } as ComposeFanOutNode;
       }
@@ -1767,7 +1857,9 @@ export const dagNodeSchema = z
         ...structuralBase,
         kind: 'include',
         include: data.include.trim(),
-        ...(data.with !== undefined ? { with: data.with as Record<string, JsonValue> } : {}),
+        ...(data.with !== undefined
+          ? { with: includeDirectiveSchema.shape.with.unwrap().parse(data.with) }
+          : {}),
       } as IncludeDirective;
     }
     if (data.workflow !== undefined && data.workflow.trim().length > 0) {
@@ -1787,7 +1879,9 @@ export const dagNodeSchema = z
         // `with:` supplies named $INPUTS to the child sub-run (#2470), validated in shape
         // by the superRefine above and mutually exclusive with `input:`. Mirrors the
         // include transform's `with` assembly.
-        ...(data.with !== undefined ? { with: data.with as Record<string, JsonValue> } : {}),
+        ...(data.with !== undefined
+          ? { with: workflowNodeSchema.shape.with.unwrap().parse(data.with) }
+          : {}),
         // Isolation is EXPLICIT-ONLY — never inferred, including from `fan_out`. How many
         // children a node spawns says nothing about whether they write; N review or
         // research children over the shared checkout is the common case. A shared-checkout

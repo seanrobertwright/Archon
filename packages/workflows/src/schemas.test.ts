@@ -840,11 +840,7 @@ describe('dagNodeSchema — per-node Pi posture (pi:)', () => {
 
 describe('dagNodeSchema — ExecNode', () => {
   test('derives authored exec fields from the resolved ExecNode owner', () => {
-    expect(dagNodeFlatSchema.shape.bash.unwrap()).toBe(execNodeSchema.shape.script);
-    expect(dagNodeFlatSchema.shape.script.unwrap()).toBe(execNodeSchema.shape.script);
     expect(dagNodeFlatSchema.shape.deps.unwrap()).toBe(execNodeSchema.shape.deps);
-    expect(dagNodeFlatSchema.shape.timeout.unwrap()).toBe(execNodeSchema.shape.timeout);
-    expect(dagNodeFlatSchema.shape.with.unwrap()).toBe(execNodeSchema.shape.with);
     expect(KNOWN_DAG_NODE_KEYS).toEqual(new Set(Object.keys(dagNodeFlatSchema.shape)));
 
     const authoredRuntime = dagNodeFlatSchema.shape.runtime.unwrap();
@@ -852,13 +848,16 @@ describe('dagNodeSchema — ExecNode', () => {
       execNodeSchema.shape.runtime.options.filter(runtime => runtime !== 'sh')
     );
 
-    const authored = dagNodeSchema.safeParse({ id: 's', script: '   ', runtime: 'bun' });
+    const raw = { id: 's', script: '   ', runtime: 'bun' };
+    const flat = dagNodeFlatSchema.safeParse(raw);
+    const authored = dagNodeSchema.safeParse(raw);
     const resolved = execNodeSchema.safeParse({
       id: 's',
       kind: 'exec',
       script: '   ',
       runtime: 'bun',
     });
+    expect(flat.success).toBe(true);
     expect(authored.success).toBe(false);
     expect(resolved.success).toBe(false);
     if (!authored.success && !resolved.success) {
@@ -970,6 +969,143 @@ describe('dagNodeSchema — ExecNode', () => {
         script: 'echo hi',
         runtime: 'sh',
       });
+    }
+  });
+
+  test('ignores deferred exec fields on every mode that does not select them', () => {
+    const cases: readonly {
+      name: string;
+      node: Record<string, unknown>;
+      ignored: Record<string, unknown>;
+    }[] = [
+      {
+        name: 'command',
+        node: { id: 'command', command: 'review' },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'prompt',
+        node: { id: 'prompt', prompt: 'Review this.' },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'loop',
+        node: {
+          id: 'loop',
+          loop: { prompt: 'Review this.', until: 'DONE', max_iterations: 1 },
+        },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'loop_group',
+        node: {
+          id: 'loop-group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 1,
+            nodes: [{ id: 'review', prompt: 'Review this.' }],
+          },
+        },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'approval',
+        node: { id: 'approval', approval: { message: 'Continue?' } },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'wait',
+        node: { id: 'wait', wait: { duration_ms: 1 } },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'cancel',
+        node: { id: 'cancel', cancel: 'Stop.' },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'include',
+        node: { id: 'include', include: 'child' },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'workflow',
+        node: { id: 'workflow', workflow: 'child' },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'bash',
+        node: { id: 'bash', bash: 'echo hi' },
+        ignored: { script: '   ' },
+      },
+      {
+        name: 'script',
+        node: { id: 'script', script: 'console.log("hi")', runtime: 'bun' },
+        ignored: { bash: '   ' },
+      },
+    ];
+
+    for (const { name, node, ignored } of cases) {
+      const baseline = dagNodeSchema.safeParse(node);
+      const withIgnoredFields = dagNodeSchema.safeParse({ ...node, ...ignored });
+      expect(baseline.success, `${name} baseline`).toBe(true);
+      expect(withIgnoredFields.success, name).toBe(true);
+      if (baseline.success && withIgnoredFields.success) {
+        expect(withIgnoredFields.data, name).toEqual(baseline.data);
+      }
+    }
+  });
+
+  test('ignores unsupported with values on every mode that drops with', () => {
+    const cases: readonly { name: string; node: Record<string, unknown> }[] = [
+      { name: 'bash', node: { id: 'bash', bash: 'echo hi' } },
+      { name: 'prompt', node: { id: 'prompt', prompt: 'Review this.' } },
+      {
+        name: 'loop',
+        node: {
+          id: 'loop',
+          loop: { prompt: 'Review this.', until: 'DONE', max_iterations: 1 },
+        },
+      },
+      {
+        name: 'loop_group',
+        node: {
+          id: 'loop-group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 1,
+            nodes: [{ id: 'review', prompt: 'Review this.' }],
+          },
+        },
+      },
+      { name: 'approval', node: { id: 'approval', approval: { message: 'Continue?' } } },
+      { name: 'wait', node: { id: 'wait', wait: { duration_ms: 1 } } },
+      { name: 'cancel', node: { id: 'cancel', cancel: 'Stop.' } },
+    ];
+
+    for (const { name, node } of cases) {
+      const baseline = dagNodeSchema.safeParse(node);
+      const withIgnoredValue = dagNodeSchema.safeParse({ ...node, with: ['ignored'] });
+      expect(baseline.success, `${name} baseline`).toBe(true);
+      expect(withIgnoredValue.success, name).toBe(true);
+      if (baseline.success && withIgnoredValue.success) {
+        expect(withIgnoredValue.data, name).toEqual(baseline.data);
+      }
+    }
+  });
+
+  test('validates with against the exec owner after script mode is selected', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'script',
+      script: 'console.log("hi")',
+      runtime: 'bun',
+      with: ['not-a-map'],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toBe(
+        "'with' on script nodes must be an object mapping input names to values"
+      );
     }
   });
 

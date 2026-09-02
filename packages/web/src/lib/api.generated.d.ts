@@ -3821,14 +3821,7 @@ export interface components {
       /** @enum {string} */
       runtime?: 'bun' | 'uv';
       deps?: string[];
-      with?: {
-        [key: string]:
-          | unknown
-          | {
-              from: string;
-              if_skipped?: unknown;
-            };
-      };
+      with?: unknown;
     };
     /** @enum {string} */
     WorkflowSource: 'project' | 'bundled' | 'global';
