@@ -62,6 +62,7 @@ mock.module('@archon/paths', () => ({
 import * as git from '@archon/git';
 import * as worktreeCopy from '../worktree-copy';
 import type { IsolationRequest, PRIsolationRequest, RepoConfigLoader } from '../types';
+import type { IIsolationStore } from '../store';
 
 // Track sync function calls for testing
 let getDefaultBranchSpy: Mock<typeof git.getDefaultBranch>;
@@ -81,6 +82,7 @@ mock.module('node:fs/promises', () => ({
 }));
 
 import { WorktreeProvider } from './worktree';
+import { IsolationResolver } from '../resolver';
 
 describe('WorktreeProvider', () => {
   let provider: WorktreeProvider;
@@ -1415,15 +1417,20 @@ describe('WorktreeProvider', () => {
       const initialLookupsComplete = new Promise<void>(resolve => {
         releaseInitialLookups = resolve;
       });
-      const branchLookups: git.BranchName[] = [];
-      findWorktreeByBranchSpy.mockImplementation(async (_repoPath, branch) => {
-        branchLookups.push(branch);
-        if (branchLookups.length <= 2) {
-          if (branchLookups.length === 2) releaseInitialLookups();
+      let worktreeListCount = 0;
+      listWorktreesSpy.mockImplementation(async () => {
+        worktreeListCount++;
+        if (worktreeListCount <= 2) {
+          if (worktreeListCount === 2) releaseInitialLookups();
           await initialLookupsComplete;
-          return null;
+          return [];
         }
-        return git.toWorktreePath(winningPath);
+        return [
+          {
+            path: git.toWorktreePath(winningPath),
+            branch: git.toBranchName('pr-42-review'),
+          },
+        ];
       });
 
       let releaseWorktreeAdds!: () => void;
@@ -1453,12 +1460,118 @@ describe('WorktreeProvider', () => {
       expect(adopted.workingPath).toBe(winningPath);
       expect(adopted.branchName).toBe(git.toBranchName('pr-42-review'));
       expect(adopted.metadata).toMatchObject({ adopted: true, adoptedFrom: 'branch' });
-      expect(branchLookups).toEqual([
-        git.toBranchName('pr-42-review'),
-        git.toBranchName('pr-42-review'),
-        git.toBranchName('pr-42-review'),
-      ]);
+      expect(worktreeListCount).toBe(3);
+      expect(findWorktreeByBranchSpy).not.toHaveBeenCalled();
       expect(worktreeAddCount).toBe(2);
+    });
+
+    test('preserves a concurrently adopted review checkout when isolation persistence fails', async () => {
+      const request: PRIsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: git.toRepoPath('/workspace/repo'),
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+      const winningConfig = {
+        baseBranch: git.toBranchName('main'),
+        path: '.worktrees/winner',
+      };
+      const losingConfig = {
+        baseBranch: git.toBranchName('main'),
+        path: '.worktrees/loser',
+      };
+      const winningProvider = new WorktreeProvider(async () => winningConfig);
+      const losingProvider = new WorktreeProvider(async () => losingConfig);
+      const winningPath = winningProvider.getWorktreePath(
+        request,
+        winningProvider.generateBranchName(request),
+        winningConfig
+      );
+      const destroySpy = spyOn(losingProvider, 'destroy').mockResolvedValue({
+        worktreeRemoved: true,
+        branchDeleted: null,
+        remoteBranchDeleted: null,
+        directoryClean: true,
+        warnings: [],
+      });
+      const store: IIsolationStore = {
+        getById: async () => null,
+        findActiveByWorkflow: async () => null,
+        create: async () => {
+          throw new Error('DB constraint violation');
+        },
+        updateStatus: async () => undefined,
+        countActiveByCodebase: async () => 0,
+      };
+      const resolver = new IsolationResolver({ store, provider: losingProvider });
+
+      let releaseInitialLookups!: () => void;
+      const initialLookupsComplete = new Promise<void>(resolve => {
+        releaseInitialLookups = resolve;
+      });
+      let worktreeListCount = 0;
+      listWorktreesSpy.mockImplementation(async () => {
+        worktreeListCount++;
+        if (worktreeListCount <= 2) {
+          if (worktreeListCount === 2) releaseInitialLookups();
+          await initialLookupsComplete;
+          return [];
+        }
+        return [
+          {
+            path: git.toWorktreePath(winningPath),
+            branch: git.toBranchName('pr-42-review'),
+          },
+        ];
+      });
+
+      let releaseWorktreeAdds!: () => void;
+      const worktreeAddsComplete = new Promise<void>(resolve => {
+        releaseWorktreeAdds = resolve;
+      });
+      let worktreeAddCount = 0;
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('worktree') && args.includes('add')) {
+          worktreeAddCount++;
+          if (worktreeAddCount === 2) releaseWorktreeAdds();
+          await worktreeAddsComplete;
+          if (!args.includes(winningPath)) {
+            throw new Error('simulated concurrent worktree rejection');
+          }
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const [winningResult, losingResult] = await Promise.allSettled([
+        winningProvider.create(request),
+        resolver.resolve({
+          existingEnvId: null,
+          codebase: {
+            id: 'cb-123',
+            defaultCwd: '/workspace/repo',
+            name: 'owner/repo',
+          },
+          hints: {
+            workflowType: 'pr',
+            workflowId: '42',
+            prBranch: git.toBranchName('feature/auth'),
+            isForkPR: true,
+          },
+          platformType: 'web',
+        }),
+      ]);
+
+      expect(winningResult.status).toBe('fulfilled');
+      expect(losingResult).toMatchObject({
+        status: 'rejected',
+        reason: expect.objectContaining({ message: 'DB constraint violation' }),
+      });
+      expect(destroySpy).not.toHaveBeenCalled();
+      expect(worktreeListCount).toBe(3);
+      expect(worktreeAddCount).toBe(2);
+      destroySpy.mockRestore();
     });
 
     test('keeps concurrent fork-PR launches for different PRs independent', async () => {
@@ -1488,14 +1601,67 @@ describe('WorktreeProvider', () => {
       });
       expect(worktreeAddRefs).toContain('pr-42-review');
       expect(worktreeAddRefs).toContain('pr-43-review');
-      expect(findWorktreeByBranchSpy).toHaveBeenCalledWith(
-        '/workspace/repo',
-        git.toBranchName('pr-42-review')
+      expect(listWorktreesSpy).toHaveBeenCalledTimes(2);
+      expect(findWorktreeByBranchSpy).not.toHaveBeenCalled();
+    });
+
+    test('does not adopt a slug-colliding branch for a fork-PR review checkout', async () => {
+      const request: PRIsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: git.toRepoPath('/workspace/repo'),
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+      const collidingPath = git.toWorktreePath('/workspace/worktrees/pr-42-review');
+      listWorktreesSpy.mockResolvedValue([
+        {
+          path: collidingPath,
+          branch: git.toBranchName('pr/42/review'),
+        },
+      ]);
+      findWorktreeByBranchSpy.mockResolvedValue(collidingPath);
+
+      const environment = await provider.create(request);
+
+      expect(environment.workingPath).not.toBe(collidingPath);
+      expect(environment.metadata.adopted).toBe(false);
+      expect(findWorktreeByBranchSpy).not.toHaveBeenCalled();
+    });
+
+    test('preserves worktree creation failure when only a slug-colliding branch is registered', async () => {
+      const request: PRIsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: git.toRepoPath('/workspace/repo'),
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+      const collidingPath = git.toWorktreePath('/workspace/worktrees/pr-42-review');
+      listWorktreesSpy.mockResolvedValue([
+        {
+          path: collidingPath,
+          branch: git.toBranchName('pr/42/review'),
+        },
+      ]);
+      let worktreeAddAttempted = false;
+      findWorktreeByBranchSpy.mockImplementation(async () =>
+        worktreeAddAttempted ? collidingPath : null
       );
-      expect(findWorktreeByBranchSpy).toHaveBeenCalledWith(
-        '/workspace/repo',
-        git.toBranchName('pr-43-review')
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('worktree') && args.includes('add')) {
+          worktreeAddAttempted = true;
+          throw new Error('simulated worktree add failure');
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42: simulated worktree add failure'
       );
+      expect(findWorktreeByBranchSpy).not.toHaveBeenCalled();
     });
 
     test('preserves a fork-PR worktree creation failure when no review checkout is registered', async () => {
@@ -1517,11 +1683,8 @@ describe('WorktreeProvider', () => {
       await expect(provider.create(request)).rejects.toThrow(
         'Failed to create worktree for PR #42: simulated worktree add failure'
       );
-      expect(findWorktreeByBranchSpy).toHaveBeenCalledTimes(2);
-      expect(findWorktreeByBranchSpy).toHaveBeenLastCalledWith(
-        '/workspace/repo',
-        git.toBranchName('pr-42-review')
-      );
+      expect(listWorktreesSpy).toHaveBeenCalledTimes(2);
+      expect(findWorktreeByBranchSpy).not.toHaveBeenCalled();
     });
 
     test('exhausts the bounded budget on persistent fork-PR fetch lock-race and fails before worktree creation', async () => {

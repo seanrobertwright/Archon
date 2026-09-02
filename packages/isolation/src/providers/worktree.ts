@@ -717,7 +717,9 @@ export class WorktreeProvider implements IIsolationProvider {
     // Exact-branch requests also search Git's registered worktrees because an
     // external tool may have created the checkout at a non-Archon path.
     if (exactBranch) {
-      return this.findRegisteredWorktree(request, exactBranch, Boolean(exactTaskBranch));
+      const requireExactBranch =
+        exactTaskBranch !== undefined || (isPRIsolationRequest(request) && request.isForkPR);
+      return this.findRegisteredWorktree(request, exactBranch, requireExactBranch);
     }
 
     return null;
@@ -1251,7 +1253,7 @@ export class WorktreeProvider implements IIsolationProvider {
           { timeout: GIT_OPERATION_TIMEOUT_MS }
         );
       } catch (error) {
-        const adopted = await this.findRegisteredWorktree(request, reviewBranch);
+        const adopted = await this.findRegisteredWorktree(request, reviewBranch, true);
         if (adopted) {
           return adopted;
         }
