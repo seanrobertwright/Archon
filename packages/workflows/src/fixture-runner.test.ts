@@ -3,6 +3,7 @@ import { describe, it, expect, beforeAll, afterAll, mock } from 'bun:test';
 import {
   cpSync,
   existsSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -745,6 +746,41 @@ describe('runFixtures', () => {
   // `readdir` yields filesystem order, which varies by machine and filesystem. Two CI
   // runs on unrelated PRs failed here with the same fixtures in swapped order before
   // discovery defined one. Creation order below is deliberately reverse-alphabetical.
+  // R4: the sort in workflowNamesBeside only matters when one fixtures/ dir has two
+  // sibling workflow YAMLs — otherwise a single name hides any ordering. These names
+  // reach the operator in a "no discovered workflow matches" failure.
+  it('orders the sibling workflow names beside one fixtures dir', async () => {
+    const cwd = makeTempProject();
+    const dir = join(cwd, '.archon', 'workflows', 'pack', 'two');
+    mkdirSync(join(dir, 'fixtures'), { recursive: true });
+    // Created zulu-first so filesystem order is the wrong answer.
+    writeFileSync(join(dir, 'zulu-wf.yaml'), stubWorkflowYaml('zulu-wf'));
+    writeFileSync(join(dir, 'alfa-wf.yaml'), stubWorkflowYaml('alfa-wf'));
+    writeFileSync(join(dir, 'fixtures', 'two.stubs.yaml'), STUB_FIXTURE);
+
+    // No workflow is passed in, so the fixture matches nothing and the failure names
+    // every sibling candidate — the surface these names actually reach.
+    const report = await runFixtures({ workflows: [], cwd });
+
+    expect(report.results).toHaveLength(1);
+    expect(report.results[0].failureReason).toContain('alfa-wf, zulu-wf');
+  });
+
+  // R1: this fixtures/ dir was already found by the walk, so a read failure is a real
+  // fault, not an absence. Swallowing it would let a run exit 0 having skipped a
+  // directory it was asked to certify.
+  it('propagates a fixtures-directory read failure instead of reporting no fixtures', async () => {
+    const cwd = makeTempProject();
+    writeWorkflowDirs(cwd, ['pack/locked']);
+    const fixturesDir = join(cwd, '.archon', 'workflows', 'pack', 'locked', 'fixtures');
+    chmodSync(fixturesDir, 0o000);
+    try {
+      await expect(runFixtures({ workflows: [], cwd })).rejects.toThrow();
+    } finally {
+      chmodSync(fixturesDir, 0o755);
+    }
+  });
+
   it('reports fixtures in label order, not filesystem order', async () => {
     const cwd = makeTempProject();
     writeWorkflowDirs(cwd, ['pack/zulu', 'pack/mike', 'pack/alfa']);

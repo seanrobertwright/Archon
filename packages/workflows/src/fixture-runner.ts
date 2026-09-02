@@ -161,7 +161,7 @@ interface DiscoveredFixture {
 async function workflowNamesBeside(fixturesDir: string): Promise<string[]> {
   const parent = join(fixturesDir, '..');
   const names: string[] = [];
-  for (const entry of (await readdir(parent)).sort()) {
+  for (const entry of await readdir(parent)) {
     if (!entry.endsWith('.yaml') && !entry.endsWith('.yml')) continue;
     try {
       const doc = Bun.YAML.parse(await Bun.file(join(parent, entry)).text());
@@ -179,6 +179,9 @@ async function workflowNamesBeside(fixturesDir: string): Promise<string[]> {
       );
     }
   }
+  // Sorted, not merely deduped: two sibling workflow YAMLs beside one fixtures/ dir
+  // would otherwise yield names in filesystem order, and these reach the operator in
+  // a no-matching-workflow failure. Covered by the two-sibling test.
   return [...new Set(names)].sort();
 }
 
@@ -192,7 +195,10 @@ async function fixturesInDir(
     .split(sep)
     .filter(segment => segment.length > 0);
   const workflowNames = await workflowNamesBeside(fixturesDir);
-  const files = await readdir(fixturesDir).catch(() => []);
+  // No catch: the walk already saw this directory, so a read failure here is a real
+  // fault (EACCES/EIO), not an absence. Swallowing it would let `workflow test` exit 0
+  // having silently skipped a directory instead of certifying it.
+  const files = await readdir(fixturesDir);
   return files
     .filter(file => file.endsWith(FIXTURE_SUFFIX))
     .map(file => ({
