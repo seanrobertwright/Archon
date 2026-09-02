@@ -297,12 +297,16 @@ function readRunStatus(archonHome: string, runId: string): string | undefined {
  * (#2306). `workflow-terminal-event.integration.spec.ts` catches for exactly this
  * reason; a bare loop here would surface a startup race as a test failure.
  */
-async function waitFor<T>(what: string, read: () => T | undefined, timeoutMs = 30_000): Promise<T> {
+async function waitFor<T>(
+  what: string,
+  read: () => T | undefined | Promise<T | undefined>,
+  timeoutMs = 30_000
+): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
-      const value = read();
+      const value = await read();
       if (value !== undefined) return value;
     } catch (error) {
       lastError = error;
@@ -345,8 +349,12 @@ describe('archon workflow wait against a detached run', () => {
 
       // The detail comes from an ordinary inspection afterwards — polling is now a
       // diagnostic, not the orchestration contract.
-      const detail = await runCli(fixture, ['workflow', 'get', runId, '--json']);
-      expect(JSON.parse(detail.stdout.trim())).toMatchObject({
+      const detail = await waitFor('workflow get to read the terminal run', async () => {
+        const inspected = await runCli(fixture, ['workflow', 'get', runId, '--json']);
+        if (inspected.exitCode !== 0) throw new Error(inspected.stderr || inspected.stdout);
+        return JSON.parse(inspected.stdout.trim()) as Record<string, unknown>;
+      });
+      expect(detail).toMatchObject({
         id: runId,
         status,
       });
