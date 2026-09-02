@@ -12,8 +12,10 @@ import {
   mock,
   jest,
   type Mock,
+  afterAll,
 } from 'bun:test';
 import {
+  existsSync,
   appendFileSync,
   mkdirSync,
   mkdtempSync,
@@ -310,6 +312,11 @@ const mockResolveContinuationWorkflow = mock<typeof WorkflowExecutor.resolveCont
   () => Promise.resolve(undefined)
 );
 
+const mockArtifactsRoot = mkdtempSync(join(tmpdir(), 'archon-cli-container-artifacts-'));
+afterAll(async () => {
+  await removeTempTree(mockArtifactsRoot);
+});
+
 mock.module('@archon/workflows/executor', () => ({
   // Mirrors the real executor's adopt site (#2690): rename happens, then the wrap's
   // `capturedSourceOwner.adopt()` is called. For a continuation (no `preparedSource`)
@@ -359,6 +366,19 @@ mock.module('@archon/workflows/executor', () => ({
   recordSelectedWorkflow: mock(() => Promise.resolve()),
   disposeWorkflowSource: mock(() => Promise.resolve()),
   finalizeWorkflowSource: mock((_deps: unknown, prepared: unknown) => Promise.resolve(prepared)),
+  // The container dispatch resolves the run's artifacts directory to bind it into the
+  // container and creates it on the host first, so hand it a real, reclaimed temp path.
+  resolveProjectPaths: mock(() =>
+    Promise.resolve({
+      artifactsDir: join(mockArtifactsRoot, 'artifacts', 'runs', 'test-run-id'),
+      workflowSourceDir: join(mockArtifactsRoot, 'workflow-source', 'runs', 'test-run-id'),
+      logDir: join(mockArtifactsRoot, 'logs'),
+      artifactsRoot: join(mockArtifactsRoot, 'artifacts'),
+      stateDir: join(mockArtifactsRoot, 'state'),
+      outputRoot: mockArtifactsRoot,
+      identityResolution: 'resolved' as const,
+    })
+  ),
 }));
 mock.module('@archon/workflows/dry-run', () => ({
   loadDryRunStubs: mock(() => Promise.resolve({ node: 'stubbed output' })),
@@ -2299,6 +2319,47 @@ describe('workflowRunCommand — continuation and capture ownership (#2646)', ()
       'hold:/test/finalized/workflow-source',
       'reclaim:/test/finalized/workflow-source',
     ]);
+  });
+
+  it('binds the run artifacts directory into the container, created on the host first', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const codebaseDb = await import('@archon/core/db/codebases');
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+      errors: [],
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-folder',
+      name: 'platform',
+      default_cwd: '/test/path',
+      default_branch: null,
+      kind: 'folder',
+    });
+    const expectedArtifacts = join(mockArtifactsRoot, 'artifacts', 'runs', 'test-run-id');
+    // Ownership matters: a bind target Docker creates itself is root-owned on a rootful
+    // daemon, so the directory must already exist when prepare() is reached.
+    let existedAtPrepare: boolean | undefined;
+    mockFolderBackendPrepare.mockImplementationOnce((req?: unknown) => {
+      const artifactsMount = (req as { artifactsMount?: string } | undefined)?.artifactsMount;
+      existedAtPrepare = artifactsMount !== undefined && existsSync(artifactsMount);
+      return Promise.resolve({
+        cwd: '/test/path',
+        execContext: { kind: 'host' as const },
+        envId: 'container-env-1',
+        overlayMode: 'volume-copy' as const,
+      });
+    });
+
+    await workflowRunCommand('/test/path', 'assist', 'go', { container: true });
+
+    expect(mockFolderBackendPrepare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceMount: '/test/capture',
+        artifactsMount: expectedArtifacts,
+      })
+    );
+    expect(existedAtPrepare).toBe(true);
   });
 });
 
