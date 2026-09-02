@@ -1493,6 +1493,27 @@ describe('validateWorkflowResources — skills search roots', () => {
 // =============================================================================
 
 describe('validateWorkflowResources — output_format compiles', () => {
+  test('no issue for the inert output_format on a loop_group itself', async () => {
+    // The loader and this pass must agree: a group's own schema governs nothing, so a
+    // dangling $ref there is not a contract failure here either.
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'group',
+        kind: 'loop_group',
+        output_format: { type: 'object', properties: { done: { $ref: '#/$defs/missing' } } },
+        loop_group: {
+          until_bash: 'exit 0',
+          max_iterations: 1,
+          nodes: [{ id: 'work', kind: 'exec', runtime: 'sh', script: 'echo done' }],
+        },
+      } as unknown as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+
+    expect(issues.filter(i => i.field === 'output_format')).toHaveLength(0);
+  });
+
   test('error when a declared output_format cannot be compiled', async () => {
     const workflow = makeWorkflow('test', [
       {

@@ -15,7 +15,6 @@ import {
   isLoopGroupNode,
   isGateNode,
   isWaitNode,
-  isHaltNode,
   isWorkflowNode,
   isIncludeDirective,
   isComposeFanOutNode,
@@ -32,13 +31,8 @@ import {
 } from '@archon/providers';
 import {
   dagNodeSchema,
-  BASH_NODE_AI_FIELDS,
-  LOOP_NODE_AI_FIELDS,
-  LOOP_GROUP_NODE_AI_FIELDS,
-  GATE_AND_HALT_IGNORED_FIELDS,
-  WAIT_NODE_IGNORED_FIELDS,
-  INCLUDE_NODE_IGNORED_FIELDS,
-  WORKFLOW_NODE_IGNORED_FIELDS,
+  ignoredFieldsForNode,
+  isOutputFormatEnforced,
   KNOWN_DAG_NODE_KEYS,
   KNOWN_NODE_NESTED_KEYS,
   effortLevelSchema,
@@ -680,28 +674,7 @@ function parseDagNode(
   }
 
   // Warn about AI-specific fields on non-AI nodes (runtime behavior, not schema errors)
-  let nonAiNode: { type: string; fields: readonly string[] } | undefined;
-  if (isIncludeDirective(node)) {
-    nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
-  } else if (isComposeFanOutNode(node)) {
-    // Same execution-less posture as a static include: the composed body's own nodes
-    // carry their config, so AI-level fields declared here are ignored (#2512).
-    nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
-  } else if (isHaltNode(node)) {
-    nonAiNode = { type: 'cancel', fields: GATE_AND_HALT_IGNORED_FIELDS };
-  } else if (isWorkflowNode(node)) {
-    nonAiNode = { type: 'workflow', fields: WORKFLOW_NODE_IGNORED_FIELDS };
-  } else if (isGateNode(node)) {
-    nonAiNode = { type: 'approval', fields: GATE_AND_HALT_IGNORED_FIELDS };
-  } else if (isWaitNode(node)) {
-    nonAiNode = { type: 'wait', fields: WAIT_NODE_IGNORED_FIELDS };
-  } else if (isLoopNode(node)) {
-    nonAiNode = { type: 'loop', fields: LOOP_NODE_AI_FIELDS };
-  } else if (isLoopGroupNode(node)) {
-    nonAiNode = { type: 'loop_group', fields: LOOP_GROUP_NODE_AI_FIELDS };
-  } else if (isExecNode(node)) {
-    nonAiNode = { type: node.runtime === 'sh' ? 'bash' : 'script', fields: BASH_NODE_AI_FIELDS };
-  }
+  const nonAiNode = ignoredFieldsForNode(node);
   if (nonAiNode) {
     const presentAiFields = nonAiNode.fields.filter(
       f => (raw as Record<string, unknown>)[f] !== undefined
@@ -1290,12 +1263,11 @@ export function validateNodeOutputFormats(
 ): string | null {
   for (const node of nodes) {
     if (isIncludeDirective(node)) continue;
-    // Only a schema the engine will enforce is worth rejecting: agent, exec, and `loop:`
-    // nodes certify their output against it. On a loop_group, gate, or halt the field
-    // is inert (warned and ignored), so a dangling `$ref` there governs nothing and must
-    // not fail the file.
-    const enforced = isAgentNode(node) || isExecNode(node) || isLoopNode(node);
-    if (enforced && node.output_format !== undefined) {
+    // Only a schema the engine will enforce is worth rejecting. Where the field is
+    // inert (warned and ignored) a dangling `$ref` governs nothing and must not fail
+    // the file; the predicate derives from the ignored-field lists, so it stays true
+    // as those lists change.
+    if (isOutputFormatEnforced(node) && node.output_format !== undefined) {
       const compileError = compileOutputSchema(node.output_format);
       if (compileError !== null) {
         return `Node '${node.id}' declares an output_format that cannot be compiled: ${compileError}`;

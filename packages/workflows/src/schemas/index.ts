@@ -109,6 +109,8 @@ export {
   isWorkflowNode,
   isComposeFanOutNode,
   isIncludeDirective,
+  ignoredFieldsForNode,
+  isOutputFormatEnforced,
   isPersistableNode,
   isNodeContextResume,
   isTriggerRule,

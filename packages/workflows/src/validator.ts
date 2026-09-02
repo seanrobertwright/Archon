@@ -45,6 +45,7 @@ import {
   isLoopNode,
   isLoopGroupNode,
   isIncludeDirective,
+  isOutputFormatEnforced,
   isWorkflowNode,
 } from './schemas';
 import { parseWorkflow } from './loader';
@@ -471,12 +472,13 @@ export async function validateWorkflowResources(
     if (isIncludeDirective(node)) continue;
 
     // --- Declared contract compiles (#2453) ---
-    // parseWorkflow already rejects an uncompilable `output_format`, so a file-fed
-    // caller never reaches this branch. It is kept for the callers that hand this
-    // pass a definition built in memory (tests, and any future synthesized or
-    // programmatically-assembled workflow), which would otherwise validate clean
-    // and then fail at the node boundary after the spend.
-    if (node.output_format !== undefined) {
+    // parseWorkflow already rejects an uncompilable `output_format` on an enforced
+    // node, so a file-fed caller never reaches this branch. It is kept for the callers
+    // that hand this pass a definition built in memory (tests, and any future
+    // synthesized or programmatically-assembled workflow), which would otherwise
+    // validate clean and then fail at the node boundary after the spend. Same
+    // predicate as the loader, so the two gates cannot disagree on an inert schema.
+    if (isOutputFormatEnforced(node) && node.output_format !== undefined) {
       const compileError = compileOutputSchema(node.output_format);
       if (compileError !== null) {
         issues.push({

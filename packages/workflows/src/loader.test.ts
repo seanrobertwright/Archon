@@ -8708,6 +8708,27 @@ nodes:
     expect(result.workflow?.nodes).toHaveLength(1);
   });
 
+  it('rejects an uncompilable output_format on a workflow: node', () => {
+    // A sub-run node's schema is enforced at runtime (the parent validates the child's
+    // value against it), so it must compile at load like any other enforced contract.
+    const result = parseWorkflow(
+      `
+name: subrun-broken-contract
+description: A workflow node whose caller schema cannot compile
+nodes:
+  - id: sub
+    workflow: some-child-workflow
+    output_format:
+      type: object
+      properties: { ready: { $ref: '#/$defs/missing' } }
+`,
+      'subrun-broken-contract.yaml'
+    );
+    expect(result.error?.error).toContain(
+      "Node 'sub' declares an output_format that cannot be compiled"
+    );
+  });
+
   it('rejects an uncompilable output_format on a loop_group body node', () => {
     const { workflow, error } = parseWorkflow(
       `
