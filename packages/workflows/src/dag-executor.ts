@@ -3959,6 +3959,11 @@ async function executeScriptNode(
       issueContext,
       adoptedRunDir: currentAdoptedRunDir(),
     }),
+    // Named Python scripts run from the frozen capture, and CPython writes bytecode
+    // caches beside any module it imports. A cache landing in the capture would change
+    // it under the run and fail the next integrity check with a misleading message.
+    // Inline scripts have no siblings, so the flag costs them nothing.
+    PYTHONDONTWRITEBYTECODE: '1',
   };
 
   // Build the command and args based on runtime and inline vs named

@@ -506,7 +506,7 @@ describe('dry-run stub scaffolding and sparse defaults (#2624)', () => {
 });
 
 describe('dryRunWorkflow', () => {
-  test('rejects a changed caller-supplied capture before simulation reads it', async () => {
+  test('refuses a changed caller-supplied capture at the node that reads it', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'archon-dry-run-capture-'));
     temporaryDirectories.push(cwd);
     mkdirSync(join(cwd, '.archon', 'commands'), { recursive: true });
@@ -520,18 +520,53 @@ describe('dryRunWorkflow', () => {
       'changed'
     );
 
-    await expect(
-      dryRunWorkflow({
-        workflow: makeTestWorkflow({
-          name: 'captured-dry-run',
-          nodes: [{ id: 'inspect', command: 'inspect' }],
-        }),
-        userMessage: '',
-        cwd,
-        sourceRoots: capturedSourceRoots(capture.anchor),
-        stubs: { inspect: 'stubbed' },
-      })
-    ).rejects.toThrow('captured source has changed');
+    const result = await dryRunWorkflow({
+      workflow: makeTestWorkflow({
+        name: 'captured-dry-run',
+        nodes: [{ id: 'inspect', command: 'inspect' }],
+      }),
+      userMessage: '',
+      cwd,
+      sourceRoots: capturedSourceRoots(capture.anchor),
+      stubs: { inspect: 'stubbed' },
+    });
+
+    expect(result.outcome).toBe('failed');
+    expect(result.trace.find(entry => entry.nodeId === 'inspect')).toMatchObject({
+      state: 'failed',
+      reason: expect.stringContaining('captured source has changed'),
+    });
+  });
+
+  test('an inline-only simulation is not invalidated by an unrelated capture change', async () => {
+    // The check guards reads from the capture. A workflow that never reads it has
+    // nothing to verify, so a changed command file elsewhere in the capture is not its
+    // concern.
+    const cwd = mkdtempSync(join(tmpdir(), 'archon-dry-run-capture-'));
+    temporaryDirectories.push(cwd);
+    mkdirSync(join(cwd, '.archon', 'commands'), { recursive: true });
+    writeFileSync(join(cwd, '.archon', 'commands', 'unused.md'), 'original');
+    const capture = await captureWorkflowSource({
+      sourceRoot: cwd,
+      captureRoot: join(cwd, 'capture'),
+    });
+    writeFileSync(
+      join(capture.anchor.root, 'project', '.archon', 'commands', 'unused.md'),
+      'changed'
+    );
+
+    const result = await dryRunWorkflow({
+      workflow: makeTestWorkflow({
+        name: 'inline-dry-run',
+        nodes: [{ id: 'think', prompt: 'inline body' }],
+      }),
+      userMessage: '',
+      cwd,
+      sourceRoots: capturedSourceRoots(capture.anchor),
+      stubs: { think: 'stubbed' },
+    });
+
+    expect(result.outcome).toBe('completed');
   });
 
   test('rechecks a named script after an earlier node changes the capture', async () => {

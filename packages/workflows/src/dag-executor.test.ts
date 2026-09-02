@@ -16828,6 +16828,34 @@ describe('executeDagWorkflow -- script nodes', () => {
     expect(dockerSpy.mock.calls.filter((call: unknown[]) => call[0] === 'docker')).toHaveLength(0);
   });
 
+  it('disables Python bytecode caching for script subprocesses', async () => {
+    // A named Python script runs from the frozen capture; a `__pycache__` written beside
+    // an imported sibling would change the capture under the run. The flag rides the
+    // same env both inline and named scripts receive, so an inline probe proves delivery.
+    const marker = join(testDir, 'bytecode-flag');
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(),
+        cwd: testDir,
+        workflow: {
+          name: 'bytecode-flag',
+          nodes: [
+            {
+              id: 'probe',
+              kind: 'exec',
+              runtime: 'bun',
+              script: `Bun.write(${JSON.stringify(marker)}, process.env.PYTHONDONTWRITEBYTECODE ?? "unset")`,
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('bytecode-flag-run'),
+      })
+    );
+
+    expect(await readFile(marker, 'utf-8')).toBe('1');
+  });
+
   it('keeps inline scripts in memory even when an unrelated captured file changes', async () => {
     const scriptsDir = join(testDir, '.archon', 'scripts');
     const captureRoot = join(testDir, 'capture');

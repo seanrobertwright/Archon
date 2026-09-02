@@ -103,8 +103,6 @@ Overlay mount mode is chosen least-privilege-first: `fuse-overlayfs` (only `--de
 
 Workflow source is a separate read-only bind at the capture's host path. Before a named script or other capture-backed read is dispatched, Archon hashes the host capture and compares it with the run's pinned source identity. This refuses a mismatch present at that checkpoint; it does not close the check-to-exec race, contain a same-UID host process, or cancel parallel nodes already running.
 
-The rest of `$ARTIFACTS_DIR` is not mounted as a writable container artifact channel. In particular, an in-container node cannot reliably create the host-side `evidence_policy.required` marker. Use a deterministic node's exit status for verification and, when a workflow needs to record its own boolean verdict, declare `outcome_field`.
-
 ## macOS / Linux notes
 
 The overlay upper/work dirs live on a VM-local named volume, never a host bind mount (a host-bind upperdir hits `EACCES` on macOS). The merged overlay is mounted at the **same absolute path** as the host cwd, so `working_path` and every path substitution are unchanged inside the container. On a standard Docker Desktop / rootful Engine daemon, expect the `native` (CAP_SYS_ADMIN) overlay mode.

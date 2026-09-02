@@ -1520,10 +1520,6 @@ There is no special verification node or verification status. Put a check in a d
 when its execution must govern success, and use `outcome_field` only when the workflow must record its
 own conclusion. Use `evidence_policy` only when a conventionally named deliverable must exist.
 
-For container runs, workflow source is separately mounted read-only, but `$ARTIFACTS_DIR` is not a
-writable host-artifact channel. An in-container node therefore cannot reliably produce the evidence
-marker. Prefer deterministic exit status and, when needed, an authored outcome.
-
 ### Binding time: includes resolve at load, runs at runtime
 
 `$INPUTS.<name>` is delivered by **two deliberately separate paths**, and the difference decides

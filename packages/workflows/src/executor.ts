@@ -1201,8 +1201,10 @@ async function runChildWorkflow(
     inputs,
   } = args;
 
-  // Every failure below returns a `{ status: 'failed' }` outcome (never throws);
-  // `childRunId` defaults to '' for failures before a child row exists.
+  // Every failure below returns a `{ status: 'failed' }` outcome; `childRunId` defaults
+  // to '' for failures before a child row exists. The one throw is
+  // `resolveChildDiscoveryRoot` refusing an unreadable or missing authoring record, which
+  // the `workflow:` node catches into the same failed outcome.
   const failOutcome = (error: string, childRunId = ''): ChildWorkflowOutcome => {
     // Reclaim the child's staged capture. Several ordinary refusals happen between
     // capturing and creating the child row — an unknown name, a cycle, the depth cap, a

@@ -1293,9 +1293,6 @@ export async function dryRunWorkflow(options: {
   config?: WorkflowConfig;
   aiProfile?: ResolvedAiProfile;
 }): Promise<DryRunResult> {
-  if (options.sourceRoots !== undefined) {
-    await assertWorkflowSourceIntegrity(options.sourceRoots);
-  }
   const assistantModels = options.config ? assistantModelDefaults(options.config) : {};
   // Same layering as the executor: declared defaults under caller-supplied values
   // (supplied wins). A workflow with no `inputs:` block keeps passthrough semantics.
