@@ -470,18 +470,6 @@ export const workflowSourceMetadataSchema = z.object({
 export type WorkflowSourceMetadata = z.infer<typeof workflowSourceMetadataSchema>;
 
 /**
- * Typed view of a run's recorded source, or `undefined` when it has no readable record.
- * Resume callers use {@link readWorkflowSourceState} when they must distinguish an absent
- * pre-capture record from an unreadable record that must fail closed.
- */
-export function readWorkflowSourceMetadata(
-  metadata: Record<string, unknown> | undefined
-): WorkflowSourceMetadata | undefined {
-  const state = readWorkflowSourceState(metadata);
-  return state.kind === 'recorded' ? state.record : undefined;
-}
-
-/**
  * What a run says about its executable source.
  *
  * Three states, and collapsing any two of them is a correctness bug:

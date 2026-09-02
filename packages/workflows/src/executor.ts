@@ -2664,6 +2664,22 @@ export async function executeWorkflow(
         { workflowRunId: workflowRun.id, captureRoot: recordedSource.root },
         'workflow.source_restored'
       );
+      if (recordedSource.source_config === undefined) {
+        // A run from before the row carried `source_config`. The manifest sits outside
+        // the digest, so nothing can prove these settings are the ones the run started
+        // with; what pinning them now buys is closing the window. From here on they are
+        // held beside the digest, and a later edit to the manifest is refused like any
+        // other drift instead of being re-read on every resume for the life of the run.
+        const pinned = { ...recordedSource, source_config: loaded.anchor.config };
+        workflowRun.metadata = { ...workflowRun.metadata, [WORKFLOW_SOURCE_METADATA_KEY]: pinned };
+        await deps.store.updateWorkflowRun(workflowRun.id, {
+          metadata: { [WORKFLOW_SOURCE_METADATA_KEY]: pinned },
+        });
+        getLog().warn(
+          { workflowRunId: workflowRun.id, captureRoot: recordedSource.root },
+          'workflow.source_config_pinned_from_manifest'
+        );
+      }
     } catch (error) {
       return await failRunOnSource(
         `This run's captured workflow source at ${recordedSource.root} is missing or altered ` +

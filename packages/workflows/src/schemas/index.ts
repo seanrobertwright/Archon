@@ -212,7 +212,6 @@ export {
   WORKFLOW_SOURCE_METADATA_KEY,
   workflowSourceConfigSchema,
   workflowSourceMetadataSchema,
-  readWorkflowSourceMetadata,
   readWorkflowSourceState,
   CONTINUATION_METADATA_KEY,
   readContinuationMode,

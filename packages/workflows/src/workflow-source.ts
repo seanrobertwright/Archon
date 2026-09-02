@@ -763,7 +763,7 @@ export async function resolveRunSourceCapture(
         captureRoot: state.record.root,
         warning:
           'This pre-change run did not record source resolution settings outside its capture. ' +
-          'The verified manifest settings are pinned for this process only and were not backfilled.',
+          'The manifest settings are used for this read; a resume pins them on the run row.',
       },
       'workflow.source_config_legacy_manifest_anchor'
     );

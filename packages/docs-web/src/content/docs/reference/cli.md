@@ -296,7 +296,7 @@ These checks detect a mismatch present when Archon checks; they do not seal the 
 
 The one exception is a run that started before Archon captured source at all. It has nothing recorded to honor, so it resumes against the current source on disk with a warning. A run whose source record exists but cannot be read is *not* treated that way — it fails, because a run that recorded its source must never quietly execute something else.
 
-An older captured run may have a digest in its run row but no out-of-band copy of its source-resolution settings. Archon still verifies its tree against that digest, reads the settings from the verified manifest once, pins them for the resumed process, and logs the limitation. It does not backfill the run row: doing so would misrepresent a manifest value as proof of the original setting.
+An older captured run may have a digest in its run row but no out-of-band copy of its source-resolution settings. Archon still verifies its tree against that digest, reads the settings from the manifest, and on the first resume records them on the run row beside the digest, with a warning. Nothing can prove those settings are the ones the run started with, since the manifest is outside the digest; pinning them closes the window, so a later edit to the manifest is refused like any other change.
 
 **Compiled binaries.** A binary embeds its bundled workflows, commands, and scripts as constants rather than files. Those get written into the capture alongside everything else, so they are covered by the same digest — which means upgrading Archon between pausing and resuming a run is fine: the run keeps executing the bundled content it started with, and a change to those bytes would be caught like any other.
 
