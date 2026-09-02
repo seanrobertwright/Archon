@@ -562,7 +562,9 @@ describe('WorktreeProvider', () => {
         isForkPR: false,
       };
 
-      await provider.create(request);
+      const environment = await provider.create(request);
+
+      expect(environment.branchName).toBe(git.toBranchName('feature/auth'));
 
       // PR branch fetch is delegated to syncWorkspace with fetch-only mode so
       // the bounded ref-lock retry lives in @archon/git.
@@ -612,7 +614,9 @@ describe('WorktreeProvider', () => {
         isForkPR: true,
       };
 
-      await provider.create(request);
+      const environment = await provider.create(request);
+
+      expect(environment.branchName).toBe(git.toBranchName('pr-42-review'));
 
       // Verify fetch with PR ref (fork PRs use pull/N/head)
       expect(execSpy).toHaveBeenCalledWith(
@@ -659,7 +663,9 @@ describe('WorktreeProvider', () => {
         isForkPR: true,
       };
 
-      await provider.create(request);
+      const environment = await provider.create(request);
+
+      expect(environment.branchName).toBe(git.toBranchName('pr-42-review'));
 
       // Verify fetch with PR ref and local branch creation
       expect(execSpy).toHaveBeenCalledWith(
@@ -731,6 +737,44 @@ describe('WorktreeProvider', () => {
         return args.includes('add');
       });
       expect(addCalls).toHaveLength(0);
+    });
+
+    test('adopts an expected-path fork-PR worktree by its synthetic review branch', async () => {
+      const request: PRIsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: git.toRepoPath('/workspace/repo'),
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+      worktreeExistsSpy.mockResolvedValue(true);
+      getCurrentBranchStrictSpy.mockResolvedValue(git.toBranchName('pr-42-review'));
+
+      const environment = await provider.create(request);
+
+      expect(getCurrentBranchStrictSpy).toHaveBeenCalledWith(environment.workingPath);
+      expect(environment.branchName).toBe(git.toBranchName('pr-42-review'));
+      expect(environment.metadata).toHaveProperty('adopted', true);
+      expect(findWorktreeByBranchSpy).not.toHaveBeenCalled();
+    });
+
+    test('refuses an expected-path fork-PR worktree on a different branch', async () => {
+      const request: PRIsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: git.toRepoPath('/workspace/repo'),
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+      worktreeExistsSpy.mockResolvedValue(true);
+      getCurrentBranchStrictSpy.mockResolvedValue(git.toBranchName('feature/auth'));
+
+      await expect(provider.create(request)).rejects.toThrow(
+        "expected branch 'pr-42-review', found 'feature/auth'"
+      );
+      expect(findWorktreeByBranchSpy).not.toHaveBeenCalled();
     });
 
     test('throws when worktree belongs to different repo root (cross-checkout)', async () => {
@@ -1339,6 +1383,144 @@ describe('WorktreeProvider', () => {
           'pr-42-review',
         ]),
         expect.any(Object)
+      );
+    });
+
+    test('adopts the registered review checkout when concurrent fork-PR worktree creation loses the race', async () => {
+      const request: PRIsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: git.toRepoPath('/workspace/repo'),
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+      const winningConfig = {
+        baseBranch: git.toBranchName('main'),
+        path: '.worktrees/winner',
+      };
+      const losingConfig = {
+        baseBranch: git.toBranchName('main'),
+        path: '.worktrees/loser',
+      };
+      const winningProvider = new WorktreeProvider(async () => winningConfig);
+      const losingProvider = new WorktreeProvider(async () => losingConfig);
+      const winningPath = winningProvider.getWorktreePath(
+        request,
+        winningProvider.generateBranchName(request),
+        winningConfig
+      );
+
+      let releaseInitialLookups!: () => void;
+      const initialLookupsComplete = new Promise<void>(resolve => {
+        releaseInitialLookups = resolve;
+      });
+      const branchLookups: git.BranchName[] = [];
+      findWorktreeByBranchSpy.mockImplementation(async (_repoPath, branch) => {
+        branchLookups.push(branch);
+        if (branchLookups.length <= 2) {
+          if (branchLookups.length === 2) releaseInitialLookups();
+          await initialLookupsComplete;
+          return null;
+        }
+        return git.toWorktreePath(winningPath);
+      });
+
+      let releaseWorktreeAdds!: () => void;
+      const worktreeAddsComplete = new Promise<void>(resolve => {
+        releaseWorktreeAdds = resolve;
+      });
+      let worktreeAddCount = 0;
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('worktree') && args.includes('add')) {
+          worktreeAddCount++;
+          if (worktreeAddCount === 2) releaseWorktreeAdds();
+          await worktreeAddsComplete;
+          if (!args.includes(winningPath)) {
+            throw new Error('simulated concurrent worktree rejection');
+          }
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const [created, adopted] = await Promise.all([
+        winningProvider.create(request),
+        losingProvider.create(request),
+      ]);
+
+      expect(created.workingPath).toBe(winningPath);
+      expect(created.metadata).toHaveProperty('adopted', false);
+      expect(adopted.workingPath).toBe(winningPath);
+      expect(adopted.branchName).toBe(git.toBranchName('pr-42-review'));
+      expect(adopted.metadata).toMatchObject({ adopted: true, adoptedFrom: 'branch' });
+      expect(branchLookups).toEqual([
+        git.toBranchName('pr-42-review'),
+        git.toBranchName('pr-42-review'),
+        git.toBranchName('pr-42-review'),
+      ]);
+      expect(worktreeAddCount).toBe(2);
+    });
+
+    test('keeps concurrent fork-PR launches for different PRs independent', async () => {
+      const request42: PRIsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: git.toRepoPath('/workspace/repo'),
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+      const request43: PRIsolationRequest = {
+        ...request42,
+        identifier: '43',
+        prBranch: git.toBranchName('feature/billing'),
+      };
+
+      const environments = await Promise.all([
+        provider.create(request42),
+        provider.create(request43),
+      ]);
+
+      expect(environments.map(environment => environment.metadata.adopted)).toEqual([false, false]);
+      const worktreeAddRefs = execSpy.mock.calls.flatMap((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('worktree') && args.includes('add') ? [args.at(-1)] : [];
+      });
+      expect(worktreeAddRefs).toContain('pr-42-review');
+      expect(worktreeAddRefs).toContain('pr-43-review');
+      expect(findWorktreeByBranchSpy).toHaveBeenCalledWith(
+        '/workspace/repo',
+        git.toBranchName('pr-42-review')
+      );
+      expect(findWorktreeByBranchSpy).toHaveBeenCalledWith(
+        '/workspace/repo',
+        git.toBranchName('pr-43-review')
+      );
+    });
+
+    test('preserves a fork-PR worktree creation failure when no review checkout is registered', async () => {
+      const request: PRIsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: git.toRepoPath('/workspace/repo'),
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('worktree') && args.includes('add')) {
+          throw new Error('simulated worktree add failure');
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42: simulated worktree add failure'
+      );
+      expect(findWorktreeByBranchSpy).toHaveBeenCalledTimes(2);
+      expect(findWorktreeByBranchSpy).toHaveBeenLastCalledWith(
+        '/workspace/repo',
+        git.toBranchName('pr-42-review')
       );
     });
 
