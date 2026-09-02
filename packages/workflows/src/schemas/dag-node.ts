@@ -385,10 +385,20 @@ export type AgentNode = z.infer<typeof agentNodeSchema>;
  */
 export const execNodeSchema = dagNodeBaseSchema.extend({
   kind: z.literal('exec'),
-  script: z.string().min(1, 'script cannot be empty'),
+  script: z
+    .string()
+    .trim()
+    .min(1, {
+      error: issue =>
+        issue.path?.at(-1) === 'bash' ? 'bash script cannot be empty' : 'script cannot be empty',
+    }),
   runtime: z.enum(['sh', 'bun', 'uv']),
   deps: z.array(z.string().min(1, 'each dep must be a non-empty string')).optional(),
-  timeout: z.number().optional(),
+  timeout: z
+    .number()
+    .positive("'timeout' must be a positive number (ms)")
+    .finite("'timeout' must be a positive number (ms)")
+    .optional(),
   // Node-local named bindings (#2637): delivered as INPUTS_<UPPER_SNAKE> env vars.
   // Same value grammar as an agent node's command-sourced `with:`. Only meaningful
   // (and only ever populated) when `runtime !== 'sh'`.
@@ -397,6 +407,51 @@ export const execNodeSchema = dagNodeBaseSchema.extend({
 
 /** DAG node that runs a shell script, or a TypeScript/Python script via bun or uv, without AI */
 export type ExecNode = z.infer<typeof execNodeSchema>;
+
+const bashExecAuthoringSchema = z.object({
+  bash: execNodeSchema.shape.script,
+  timeout: execNodeSchema.shape.timeout,
+});
+
+const scriptExecAuthoringSchema = execNodeSchema
+  .pick({
+    script: true,
+    runtime: true,
+    deps: true,
+    timeout: true,
+    with: true,
+  })
+  .extend({
+    runtime: execNodeSchema.shape.runtime.exclude(['sh']),
+  });
+
+type BashExecAuthoring = z.infer<typeof bashExecAuthoringSchema>;
+type ScriptExecAuthoring = z.infer<typeof scriptExecAuthoringSchema>;
+type ResolvedExecAuthoring = Pick<ExecNode, 'script' | 'runtime' | 'deps' | 'timeout' | 'with'>;
+
+function resolveBashExecAuthoring({ bash, timeout }: BashExecAuthoring): ResolvedExecAuthoring {
+  return {
+    script: bash,
+    runtime: 'sh',
+    ...(timeout !== undefined ? { timeout } : {}),
+  };
+}
+
+function resolveScriptExecAuthoring({
+  script,
+  runtime,
+  deps,
+  timeout,
+  with: bindings,
+}: ScriptExecAuthoring): ResolvedExecAuthoring {
+  return {
+    script,
+    runtime,
+    ...(deps !== undefined ? { deps } : {}),
+    ...(timeout !== undefined ? { timeout } : {}),
+    ...(bindings !== undefined ? { with: bindings } : {}),
+  };
+}
 
 /**
  * Loop node schema — extends base with `loop` config.
@@ -1015,7 +1070,7 @@ export const dagNodeFlatSchema = dagNodeBaseSchema.extend({
   // Mode fields (exactly one required)
   command: z.string().optional(),
   prompt: z.string().optional(),
-  bash: z.string().optional(),
+  ...bashExecAuthoringSchema.partial().shape,
   loop: loopNodeConfigSchema.optional(),
   loop_group: loopGroupNodeConfigSchema.optional(),
   approval: approvalConfigSchema.optional(),
@@ -1036,17 +1091,10 @@ export const dagNodeFlatSchema = dagNodeBaseSchema.extend({
   // `workflow:` node it multiplies child runs (#2121 slice 2); on an `include:` node it
   // multiplies the composed body inside this run (#2512). Guarded in superRefine.
   fan_out: fanOutConfigSchema.optional(),
-  // Raw (not `z.record(z.string(), z.string())`) so each relevant node mode validates it
-  // contextually. Include and workflow nodes both accept the same identifier-keyed string
-  // map, validate it in superRefine, and retain it in their transform. Other node modes
-  // strip it with the rest of their unsupported surface.
-  with: z.unknown().optional(),
-  // Script-only
-  script: z.string().optional(),
-  runtime: z.enum(['bun', 'uv']).optional(),
-  deps: z.array(z.string().min(1, 'each dep must be a non-empty string')).optional(),
-  // Bash/Script shared
-  timeout: z.number().optional(),
+  // `bash:` and `script:` are authored projections of the resolved ExecNode contract.
+  // The projection keeps the authored runtime vocabulary narrower: shell execution is
+  // selected by `bash:`, while `script:` admits only the non-shell runtimes.
+  ...scriptExecAuthoringSchema.partial().shape,
 });
 
 // ---------------------------------------------------------------------------
@@ -1192,42 +1240,17 @@ export const dagNodeSchema = z
     // `with:` is an identifier-keyed JSON-value map on include and workflow nodes
     // (#2470, values widened from string-only in #2637). For includes it inlines at
     // load time (applyInputsMacro); for sub-runs it becomes `$INPUTS.<name>` runtime
-    // variables on the child. The flat field stays `z.unknown()` so other node
-    // variants validate it contextually. Returns the validated plain-object map, or
-    // undefined when the surrounding shape is wrong (issues already added).
+    // variables on the child. Its value type comes from the ExecNode projection above;
+    // mode-specific key and binding-directive rules remain contextual here.
     const validateWithShape = (
       kind: 'include' | 'workflow' | 'command' | 'script'
-    ): Record<string, unknown> | undefined => {
-      const prototype =
-        typeof data.with === 'object' && data.with !== null
-          ? Object.getPrototypeOf(data.with)
-          : undefined;
-      if (
-        typeof data.with !== 'object' ||
-        data.with === null ||
-        Array.isArray(data.with) ||
-        (prototype !== Object.prototype && prototype !== null)
-      ) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `'with' on ${kind} nodes must be an object mapping input names to values`,
-          path: ['with'],
-        });
-        return undefined;
-      }
-      const map = data.with as Record<string, unknown>;
-      for (const [key, value] of Object.entries(map)) {
+    ): NonNullable<typeof data.with> => {
+      const map = data.with ?? {};
+      for (const key of Object.keys(map)) {
         if (!INPUT_NAME_PATTERN.test(key)) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             message: `invalid ${kind} input name '${key}'; use letters, numbers, underscores, or hyphens and start with a letter or underscore`,
-            path: ['with'],
-          });
-        }
-        if (!jsonValueSchema.safeParse(value).success) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: `${kind} input '${key}' must be a JSON-compatible value (string, number, boolean, null, array, or object)`,
             path: ['with'],
           });
         }
@@ -1425,27 +1448,11 @@ export const dagNodeSchema = z
     }
 
     if (modeCount === 0) {
-      if (typeof data.bash === 'string') {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'bash script cannot be empty',
-          path: ['bash'],
-        });
-        return z.NEVER;
-      }
       if (typeof data.prompt === 'string') {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: 'prompt cannot be empty',
           path: ['prompt'],
-        });
-        return z.NEVER;
-      }
-      if (typeof data.script === 'string') {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'script cannot be empty',
-          path: ['script'],
         });
         return z.NEVER;
       }
@@ -1466,17 +1473,6 @@ export const dagNodeSchema = z
       });
     }
 
-    // Bash node validations
-    if (hasBash) {
-      if (data.timeout !== undefined && (data.timeout <= 0 || !isFinite(data.timeout))) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: "'timeout' must be a positive number (ms)",
-          path: ['timeout'],
-        });
-      }
-    }
-
     // Script node validations
     if (hasScript) {
       if (data.runtime === undefined) {
@@ -1484,13 +1480,6 @@ export const dagNodeSchema = z
           code: z.ZodIssueCode.custom,
           message: "'runtime' is required for script nodes ('bun' or 'uv')",
           path: ['runtime'],
-        });
-      }
-      if (data.timeout !== undefined && (data.timeout <= 0 || !isFinite(data.timeout))) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: "'timeout' must be a positive number (ms)",
-          path: ['timeout'],
         });
       }
     }
@@ -1664,10 +1653,7 @@ export const dagNodeSchema = z
 
     // Node-local bindings (#2637) — validated by validateNodeBindings above; carried
     // only by the command/script variants (other modes keep stripping the field).
-    const nodeBindings =
-      data.with !== undefined
-        ? { with: data.with as Record<string, JsonValue | BindingDirective> }
-        : {};
+    const nodeBindings = data.with !== undefined ? { with: data.with } : {};
 
     if (data.command !== undefined && data.command.trim().length > 0) {
       return {
@@ -1696,24 +1682,16 @@ export const dagNodeSchema = z
         ...base,
         ...shared,
         kind: 'exec',
-        script: data.bash.trim(),
-        runtime: 'sh',
-        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
-      } as ExecNode;
+        ...resolveBashExecAuthoring(bashExecAuthoringSchema.parse(data)),
+      } satisfies ExecNode;
     }
     if (data.script !== undefined && data.script.trim().length > 0) {
-      // runtime is guaranteed by superRefine to be defined at this point
-      if (!data.runtime) throw new Error('unreachable: runtime must be defined for script nodes');
       return {
         ...base,
         ...shared,
         kind: 'exec',
-        script: data.script.trim(),
-        runtime: data.runtime,
-        ...(data.deps !== undefined ? { deps: data.deps } : {}),
-        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
-        ...nodeBindings,
-      } as ExecNode;
+        ...resolveScriptExecAuthoring(scriptExecAuthoringSchema.parse(data)),
+      } satisfies ExecNode;
     }
     if (data.approval !== undefined) {
       // Two mechanisms, mutually exclusive (enforced by the superRefine below):

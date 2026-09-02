@@ -13,11 +13,14 @@ import {
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
   INCLUDE_NODE_IGNORED_FIELDS,
+  KNOWN_DAG_NODE_KEYS,
   WAIT_NODE_IGNORED_FIELDS,
   WORKFLOW_NODE_IGNORED_FIELDS,
   BASH_NODE_AI_FIELDS,
   approvalOnRejectSchema,
+  dagNodeFlatSchema,
   dagNodeSchema,
+  execNodeSchema,
   MAX_DURABLE_WAIT_MS,
   waitConfigSchema,
   inputEnvKey,
@@ -836,6 +839,33 @@ describe('dagNodeSchema — per-node Pi posture (pi:)', () => {
 // ---------------------------------------------------------------------------
 
 describe('dagNodeSchema — ExecNode', () => {
+  test('derives authored exec fields from the resolved ExecNode owner', () => {
+    expect(dagNodeFlatSchema.shape.bash.unwrap()).toBe(execNodeSchema.shape.script);
+    expect(dagNodeFlatSchema.shape.script.unwrap()).toBe(execNodeSchema.shape.script);
+    expect(dagNodeFlatSchema.shape.deps.unwrap()).toBe(execNodeSchema.shape.deps);
+    expect(dagNodeFlatSchema.shape.timeout.unwrap()).toBe(execNodeSchema.shape.timeout);
+    expect(dagNodeFlatSchema.shape.with.unwrap()).toBe(execNodeSchema.shape.with);
+    expect(KNOWN_DAG_NODE_KEYS).toEqual(new Set(Object.keys(dagNodeFlatSchema.shape)));
+
+    const authoredRuntime = dagNodeFlatSchema.shape.runtime.unwrap();
+    expect(authoredRuntime.options).toEqual(
+      execNodeSchema.shape.runtime.options.filter(runtime => runtime !== 'sh')
+    );
+
+    const authored = dagNodeSchema.safeParse({ id: 's', script: '   ', runtime: 'bun' });
+    const resolved = execNodeSchema.safeParse({
+      id: 's',
+      kind: 'exec',
+      script: '   ',
+      runtime: 'bun',
+    });
+    expect(authored.success).toBe(false);
+    expect(resolved.success).toBe(false);
+    if (!authored.success && !resolved.success) {
+      expect(authored.error.issues[0]?.message).toBe(resolved.error.issues[0]?.message);
+    }
+  });
+
   test('parses a bun script node with inline script', () => {
     const result = dagNodeSchema.safeParse({
       id: 'fetch',
@@ -922,6 +952,25 @@ describe('dagNodeSchema — ExecNode', () => {
       runtime: 'node',
     });
     expect(result.success).toBe(false);
+  });
+
+  test("keeps the internal 'sh' runtime behind the authored bash projection", () => {
+    const authoredScript = dagNodeSchema.safeParse({
+      id: 's',
+      script: 'echo hi',
+      runtime: 'sh',
+    });
+    expect(authoredScript.success).toBe(false);
+
+    const authoredBash = dagNodeSchema.safeParse({ id: 's', bash: 'echo hi' });
+    expect(authoredBash.success).toBe(true);
+    if (authoredBash.success) {
+      expect(authoredBash.data).toMatchObject({
+        kind: 'exec',
+        script: 'echo hi',
+        runtime: 'sh',
+      });
+    }
   });
 
   test('rejects empty script string', () => {

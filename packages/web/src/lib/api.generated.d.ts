@@ -3749,6 +3749,7 @@ export interface components {
       command?: string;
       prompt?: string;
       bash?: string;
+      timeout?: number;
       loop?: {
         until?: string;
         max_iterations: number;
@@ -3816,12 +3817,18 @@ export interface components {
          */
         join: 'all_success' | 'all_done' | 'first_success';
       };
-      with?: unknown;
       script?: string;
       /** @enum {string} */
       runtime?: 'bun' | 'uv';
       deps?: string[];
-      timeout?: number;
+      with?: {
+        [key: string]:
+          | unknown
+          | {
+              from: string;
+              if_skipped?: unknown;
+            };
+      };
     };
     /** @enum {string} */
     WorkflowSource: 'project' | 'bundled' | 'global';
