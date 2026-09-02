@@ -515,6 +515,20 @@ Examples:
     expect(result.stdout).toContain('--node');
     expect(result.stdout).toContain('--yes');
   });
+
+  it('renders --full in workflow list --help', () => {
+    const result = spawnSync(process.execPath, [CLI_ENTRY, 'workflow', 'list', '--help'], {
+      encoding: 'utf8',
+      env: { ...process.env, ARCHON_TELEMETRY_DISABLED: '1' },
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('--full');
+    // Unlike its siblings, `--full` is also mentioned in the Commands spec and
+    // description, so `toContain('--full')` alone would pass even without a
+    // scopedFlags entry. The scoped description is the unique contribution —
+    // guard it so deleting scopedFlags trips this test.
+    expect(result.stdout).toContain('exact description instead of the compact preview');
+  });
 });
 
 describe('removed continue command', () => {
