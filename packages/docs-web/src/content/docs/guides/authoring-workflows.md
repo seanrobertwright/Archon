@@ -1024,8 +1024,9 @@ is the YAML-coordinates / code-computes split. A skipped producer with **no**
 `if_skipped` fails the node with the
 binding, producer, and fix named — a binding never silently resolves to `''`.
 
-`if_skipped` only ever covers a producer that **did not run**. A producer that ran and
-**failed** always fails the binding too, whether or not `if_skipped` is declared — a
+`if_skipped` covers a producer that completed as **skipped**, including an exec node that
+ran until an opted-in timeout. A producer that **failed** always fails the binding too,
+whether or not `if_skipped` is declared — a
 `loop_group`'s failure paths in particular can leave real, non-empty output behind (its last
 completed iteration's text), so this is an explicit check, not an accident of empty output.
 There is no way to opt a binding out of this: declaring `if_skipped` never papers over a real
