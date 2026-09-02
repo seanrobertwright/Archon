@@ -188,6 +188,16 @@ export const skipCauseSchema = z.discriminatedUnion('kind', [
 
 export type SkipCause = z.infer<typeof skipCauseSchema>;
 
+export const nodeSkipReasonSchema = z.enum([
+  'prior_success',
+  'when_condition',
+  'when_condition_parse_error',
+  'trigger_rule',
+  'timeout',
+]);
+
+export type NodeSkipReason = z.infer<typeof nodeSkipReasonSchema>;
+
 /**
  * Captured output from a completed DAG node.
  * `output` is the concatenated assistant text (or JSON-encoded string from the SDK

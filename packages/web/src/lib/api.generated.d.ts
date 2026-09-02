@@ -3193,6 +3193,52 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
   schemas: {
+    DagNodeSseEvent: {
+      /** @enum {string} */
+      type: 'dag_node';
+      runId: string;
+      nodeId: string;
+      name: string;
+      /** @enum {string} */
+      status: 'running' | 'completed' | 'failed' | 'skipped';
+      duration?: number;
+      error?: string;
+      reason?: components['schemas']['NodeSkipReason'];
+      cause?: components['schemas']['SkipCause'];
+      timestamp: number;
+    };
+    /** @enum {string} */
+    NodeSkipReason:
+      | 'prior_success'
+      | 'when_condition'
+      | 'when_condition_parse_error'
+      | 'trigger_rule'
+      | 'timeout';
+    SkipCause:
+      | {
+          /** @enum {string} */
+          kind: 'condition';
+          expr: string;
+        }
+      | {
+          /** @enum {string} */
+          kind: 'condition_parse_error';
+          expr: string;
+        }
+      | {
+          /** @enum {string} */
+          kind: 'timeout';
+        }
+      | {
+          /** @enum {string} */
+          kind: 'upstream_failed';
+          origin: string;
+        }
+      | {
+          /** @enum {string} */
+          kind: 'upstream_skipped';
+          origin: string;
+        };
     AuthStatusResponse: {
       enabled: boolean;
       /** @enum {string} */
