@@ -3067,8 +3067,7 @@ branch refs/heads/feature/auth
       const result = await git.syncRepository(repo('/workspace/repo'), branch('main'));
 
       expect(result).toEqual({ ok: true, value: undefined });
-      expect(execSpy).toHaveBeenCalledWith('git', ['fetch', 'origin'], {
-        cwd: '/workspace/repo',
+      expect(execSpy).toHaveBeenCalledWith('git', ['-C', '/workspace/repo', 'fetch', 'origin'], {
         timeout: 60000,
       });
       expect(execSpy).toHaveBeenCalledWith('git', ['reset', '--hard', 'origin/main'], {
@@ -3077,14 +3076,76 @@ branch refs/heads/feature/auth
       });
     });
 
+    // syncRepository is reachable concurrently from the forge adapters on PR
+    // events, and its bare fetch updates every configured remote-tracking ref —
+    // the same contention syncWorkspace and the fork-PR path already survive.
+    test('absorbs a ref-lock race on the bare fetch and still resets', async () => {
+      const raceError = Object.assign(
+        new Error(
+          "error: cannot lock ref 'refs/remotes/origin/main': is at aaa but expected bbb\n" +
+            ' ! aaa..bbb  main -> origin/main  (unable to update local ref)'
+        ),
+        { stderr: 'unable to update local ref' }
+      );
+      execSpy.mockRejectedValueOnce(raceError).mockResolvedValue({ stdout: '', stderr: '' });
+
+      const result = await git.syncRepository(repo('/workspace/repo'), branch('main'));
+
+      expect(result).toEqual({ ok: true, value: undefined });
+      const fetches = execSpy.mock.calls.filter(([, args]) => (args as string[])[2] === 'fetch');
+      expect(fetches).toHaveLength(2);
+      expect(execSpy).toHaveBeenCalledWith('git', ['reset', '--hard', 'origin/main'], {
+        cwd: '/workspace/repo',
+        timeout: 30000,
+      });
+    });
+
+    test('exhausts the shared budget on persistent contention and reports the original evidence', async () => {
+      const raceError = Object.assign(
+        new Error(
+          "error: cannot lock ref 'refs/remotes/origin/main'\n (unable to update local ref)"
+        ),
+        { stderr: 'unable to update local ref' }
+      );
+      execSpy.mockRejectedValue(raceError);
+
+      const result = await git.syncRepository(repo('/workspace/repo'), branch('main'));
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe('unknown');
+        // The original git text survives the GitResult wrap.
+        expect(JSON.stringify(result.error)).toContain('cannot lock ref');
+      }
+      const fetches = execSpy.mock.calls.filter(([, args]) => (args as string[])[2] === 'fetch');
+      expect(fetches).toHaveLength(4);
+      const resets = execSpy.mock.calls.filter(([, args]) => (args as string[])[0] === 'reset');
+      expect(resets).toHaveLength(0);
+    });
+
+    test('attempts a non-contention fetch failure once and keeps its GitResult code', async () => {
+      const authError = Object.assign(new Error('fatal: Authentication failed for repo'), {
+        stderr: 'authentication failed',
+      });
+      execSpy.mockRejectedValue(authError);
+
+      const result = await git.syncRepository(repo('/workspace/repo'), branch('main'));
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe('permission_denied');
+      }
+      const fetches = execSpy.mock.calls.filter(([, args]) => (args as string[])[2] === 'fetch');
+      expect(fetches).toHaveLength(1);
+    });
+
     test('fetches and resets using a custom remote', async () => {
       execSpy.mockResolvedValue({ stdout: '', stderr: '' });
 
       const result = await git.syncRepository(repo('/workspace/repo'), branch('main'), 'upstream');
 
       expect(result).toEqual({ ok: true, value: undefined });
-      expect(execSpy).toHaveBeenCalledWith('git', ['fetch', 'upstream'], {
-        cwd: '/workspace/repo',
+      expect(execSpy).toHaveBeenCalledWith('git', ['-C', '/workspace/repo', 'fetch', 'upstream'], {
         timeout: 60000,
       });
       expect(execSpy).toHaveBeenCalledWith('git', ['reset', '--hard', 'upstream/main'], {

@@ -144,12 +144,16 @@ const MAX_FETCH_RETRIES = 3;
 export async function fetchWithRefLockRetry(
   repoPath: RepoPath,
   remote: string,
-  refspec: string,
+  refspec: string | undefined,
   options?: { timeoutMs?: number }
 ): Promise<{ stdout: string; stderr: string }> {
+  const args =
+    refspec === undefined
+      ? ['-C', repoPath, 'fetch', remote]
+      : ['-C', repoPath, 'fetch', remote, refspec];
   for (let attempt = 0; ; attempt++) {
     try {
-      return await execFileAsync('git', ['-C', repoPath, 'fetch', remote, refspec], {
+      return await execFileAsync('git', args, {
         timeout: options?.timeoutMs,
       });
     } catch (error) {
@@ -562,8 +566,8 @@ export async function cloneRepository(
  * Runs sequential fetch + reset --hard. If fetch fails, reset is skipped.
  * Uses execFileAsync (no shell interpolation) for safety.
  *
- * Note: Uses `cwd` option instead of `-C` flag. Both are functionally
- * equivalent; this style was chosen for readability with multi-arg commands.
+ * Note: the reset uses the `cwd` option; the fetch goes through
+ * fetchWithRefLockRetry, which uses `-C`. Both are functionally equivalent.
  *
  * @param repoPath - Path to the local repository
  * @param branch - Branch to sync to (e.g., 'main')
@@ -576,7 +580,7 @@ export async function syncRepository(
   remote = 'origin'
 ): Promise<GitResult<void>> {
   try {
-    await execFileAsync('git', ['fetch', remote], { cwd: repoPath, timeout: 60000 });
+    await fetchWithRefLockRetry(repoPath, remote, undefined, { timeoutMs: 60000 });
   } catch (error) {
     const err = error as Error & { stderr?: string };
     const errorText = `${err.message} ${err.stderr ?? ''}`.toLowerCase();
