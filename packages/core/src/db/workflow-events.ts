@@ -404,7 +404,10 @@ export async function listActiveWorkflowNodeIds(
 }
 
 export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
-  completedNodeOutputs: Map<string, { output: string; structuredOutput?: unknown }>;
+  completedNodeOutputs: Map<
+    string,
+    { output: string; structuredOutput?: unknown; declaredFields?: readonly string[] }
+  >;
   fanOutSnapshots: Map<string, readonly FanOutInstanceSnapshot[]>;
   unresolvedNodeStarts: Set<string>;
   tokens?: TokenUsage;
@@ -422,7 +425,10 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
      ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
     [workflowRunId, ...NODE_LIFECYCLE_EVENT_TYPES, 'fan_out_instances']
   );
-  const completedNodeOutputs = new Map<string, { output: string; structuredOutput?: unknown }>();
+  const completedNodeOutputs = new Map<
+    string,
+    { output: string; structuredOutput?: unknown; declaredFields?: readonly string[] }
+  >();
   const fanOutSnapshots = new Map<string, readonly FanOutInstanceSnapshot[]>();
   const unresolvedNodeStarts = new Set<string>();
   // Collected and merged once at the end rather than folded pairwise: a pairwise fold
@@ -510,6 +516,15 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
           );
         }
       }
+      // The field-access contract this node completed under (#2453), written only by
+      // `workflow:` nodes — the child owns that projection, so re-deriving it from the
+      // parent's own definition on resume would lose it. Accepted only as an array of
+      // strings; anything else is corrupt and degrades to "no persisted contract".
+      const rawDeclaredFields = data.declared_fields;
+      const declaredFields =
+        Array.isArray(rawDeclaredFields) && rawDeclaredFields.every(f => typeof f === 'string')
+          ? rawDeclaredFields
+          : undefined;
       completedNodeOutputs.set(row.step_name, {
         output,
         // The node's logical value (#2637), persisted beside its text by the emit
@@ -518,6 +533,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
         ...(data.structured_output !== undefined
           ? { structuredOutput: data.structured_output }
           : {}),
+        ...(declaredFields !== undefined ? { declaredFields } : {}),
       });
     }
     // Composed-instance terminals are the durable accounting source for their whole

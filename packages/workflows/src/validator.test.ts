@@ -1514,6 +1514,26 @@ describe('validateWorkflowResources — output_format compiles', () => {
     expect(issues.filter(i => i.field === 'output_format')).toHaveLength(0);
   });
 
+  test('error when a workflow: node declares output_format, naming the child returns: node', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'sub',
+        kind: 'workflow',
+        workflow: 'child-workflow',
+        output_format: { type: 'object', properties: { green: { type: 'boolean' } } },
+      } as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const errors = issues.filter(i => i.field === 'output_format');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].level).toBe('error');
+    expect(errors[0].nodeId).toBe('sub');
+    expect(errors[0].message).toBe(
+      "Node 'sub' declares output_format on a workflow: node; the result contract belongs to the child's returns: node — declare it there"
+    );
+  });
+
   test('error when a declared output_format cannot be compiled', async () => {
     const workflow = makeWorkflow('test', [
       {

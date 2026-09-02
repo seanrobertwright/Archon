@@ -895,9 +895,10 @@ export const composeFanOutConfigSchema = fanOutConfigSchema.extend({
  * child-isolation resolver — never inferred, including from `fan_out`. `fan_out` (slice 2,
  * PR-C) expands the node into N child runs over a data-driven item list; concurrent
  * children sharing the parent checkout are the author's call to make, declared by
- * `mutates_checkout: false` on the child workflow. `output_format`/`output_type` from the base stay
- * meaningful (the child's terminal output threads back as `$<id>.output`,
- * field-accessible when a schema is declared and the child emits JSON).
+ * `mutates_checkout: false` on the child workflow. `output_type` from the base stays
+ * meaningful (typed sidecar). `output_format` is a LOAD ERROR on this node (#2453): the
+ * child's `returns:` node owns the result contract, and its declared field names travel
+ * back with the result, so `$<id>.output.field` is authorized by the child's schema.
  */
 export const workflowNodeSchema = dagNodeBaseSchema.extend({
   kind: z.literal('workflow'),
@@ -1082,11 +1083,12 @@ export const INCLUDE_NODE_IGNORED_FIELDS: readonly string[] = [
 /**
  * Fields that are meaningless on a workflow (sub-run) node — it starts a child
  * run and makes no direct provider call, so every AI-turn field is ignored (the
- * child's own nodes carry theirs). `output_format` is deliberately EXCLUDED from
- * this list (unlike bash/include): it stays meaningful so `$<id>.output.field`
- * works against a child that emits JSON. `output_type` (typed sidecar) and the
- * structural graph fields (id / depends_on / when / trigger_rule / description /
- * input / isolation) are likewise meaningful and absent here.
+ * child's own nodes carry theirs). `output_format` is absent for the same reason
+ * it is absent from WAIT_NODE_IGNORED_FIELDS: the loader REJECTS it outright
+ * (#2453 — the child's `returns:` node owns the result contract), so it never
+ * reaches this warn set. `output_type` (typed sidecar) and the structural graph
+ * fields (id / depends_on / when / trigger_rule / description / input / isolation)
+ * are meaningful and absent here.
  */
 // `mutates_checkout` is appended rather than filtered out: enforcement (#2771) is
 // per-node over the parent checkout, which a sub-run child does not own — its own
@@ -1898,10 +1900,11 @@ export const dagNodeSchema = z
     if (data.workflow !== undefined && data.workflow.trim().length > 0) {
       // A workflow (sub-run) node makes no direct provider call, so it carries only
       // the structural graph fields plus the sub-run surface: the target name, the
-      // input data string, the reserved isolation mode, and the output typing fields
-      // (output_type → typed sidecar; output_format → `$id.output.field` on a JSON
-      // child). aiOnly / shared(retry) / exec-only base fields are dropped; the loader
-      // warns about them via WORKFLOW_NODE_IGNORED_FIELDS.
+      // input data string, the reserved isolation mode, and `output_type` (typed
+      // sidecar). `output_format` is copied through ONLY so the loader can reject it by
+      // node id (#2453): the child's `returns:` node owns the result contract. aiOnly /
+      // shared(retry) / exec-only base fields are dropped; the loader warns about them
+      // via WORKFLOW_NODE_IGNORED_FIELDS.
       return {
         ...structuralBase,
         kind: 'workflow',
@@ -2039,7 +2042,9 @@ export function ignoredFieldsForNode(
  * the field (loop_group, gate, halt, include, composed fan-out) is inert, everything
  * else (agent, exec, `loop:`, `workflow:`) certifies or validates against it. The
  * load-time compile gate and the resource validator both read this, so a schema is
- * rejected at load exactly where a broken one would later fail a node.
+ * rejected at load exactly where a broken one would later fail a node. A `workflow:`
+ * node's `output_format` is rejected at load by ownership before this predicate is
+ * consulted, so its answer there is never reached.
  */
 export function isOutputFormatEnforced(node: DagNode | IncludeDirective): boolean {
   return !ignoredFieldsForNode(node)?.fields.includes('output_format');

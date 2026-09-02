@@ -101,7 +101,7 @@ In DAG workflows, nodes can reference the output of any completed upstream node.
 | `$nodeId.output` | Full output string of the referenced node | The node must be a declared dependency (in `depends_on`) |
 | `$nodeId.output.field` | A specific JSON field from the node's output | Works on any JSON-object output; `output_format` adds stricter validation — see notes below |
 
-A `.field` reference **fails the consuming node** when the producer's output is not a JSON object — whether or not the producer declared an `output_format`. Declaring a schema buys you a stricter check on the field *name* (an undeclared field fails the consuming node with a named error rather than resolving to a silent empty), and lets a declared-but-absent field resolve to `''`; it never makes a broken producer quieter. This matters most for `workflow:` sub-run nodes, where `output_format` is enforced against what the child actually returns: a mismatch fails the parent node with an error naming the node, the child workflow, the failing path, the expected shape, and the received type.
+A `.field` reference **fails the consuming node** when the producer's output is not a JSON object — whether or not the producer declared an `output_format`. Declaring a schema buys you a stricter check on the field *name* (an undeclared field fails the consuming node with a named error rather than resolving to a silent empty), and lets a declared-but-absent field resolve to `''`; it never makes a broken producer quieter. For a `workflow:` sub-run node the contract is the child's own: the `output_format` on the child's `returns:` node certifies the value and its declared field names travel back with the result, so `$sub.output.field` is strict under the child's schema. Declaring `output_format` on the `workflow:` node itself is a load error — the result contract belongs to the child's `returns:` node.
 
 During the current run, downstream interpolation and `when:` conditions see the full returned node output. Successful bash events retain only a 32 KiB UTF-8 audit preview, so after a process boundary a resumed run rehydrates that persisted preview rather than the full output. If a large gate verdict must survive a restart intact, store it through a deliberately managed artifact contract instead of relying on the event preview.
 
@@ -213,6 +213,46 @@ script node or a declared `green` workflow input. Engine-owned names such as `AR
 `with:` on other node types: `include:` and `workflow:` nodes keep their existing caller-input
 meaning (values may be any JSON value); on `bash:`, `prompt:`, and loop nodes the field is
 ignored with a load warning — inline bodies already reference `$node.output` directly.
+
+### Artifact pointers in a result
+
+A node output is a value, not a file. When a node produces something large, write it under
+`$ARTIFACTS_DIR` and return a **pointer** to it inside the result:
+
+```json
+{ "type": "archon_artifact", "run_id": "01JD…", "path": "review/report.md" }
+```
+
+`type: "archon_artifact"` is reserved by the engine. Any object carrying it, at any depth in
+a node's logical value, must be a valid pointer: `run_id` and `path` are required non-empty
+strings. `path` is relative to the run's own artifacts directory. For how a pointer fits
+into a workflow's declared result, see
+[Authoring workflows → Result contracts](/guides/authoring-workflows/#result-contracts).
+
+Every pointer is checked once, **at the producing node and against its own run**, before the
+value is persisted — so a bad one fails the node that produced it rather than surfacing
+later as a broken link:
+
+| Rule | Rejected |
+|------|----------|
+| Own run | A `run_id` other than the producing run's own (`$WORKFLOW_ID`). A result may only point at its own run's artifacts today. |
+| Addressable run | A run whose output location was never recorded, or one recorded outside the Archon home directory. |
+| Relative path | An absolute path, a `..` segment, or a NUL byte. |
+| Containment | A path that resolves lexically outside the run's artifacts directory. |
+| Real file | A missing target, or a directory. |
+
+A `workflow:` parent and a fan-out aggregate relay a child's value unchanged: the child
+already proved its pointers against the only run it may name. Reachability and real-path
+checks belong to the read side by design — whether a reader may see that run, and whether
+the path still resolves inside its artifacts directory once symlinks are followed.
+`GET /api/artifacts/<run_id>/<path>` does lexical containment on the untrusted request
+today; real-path resolution at read time is not yet implemented (#3160).
+
+The value stays a run id plus a relative path in node outputs, events, sub-run results,
+fan-out aggregates, and resumed runs. Archon never rewrites it into an absolute path and
+never loads the file's contents into a prompt. There is no in-workflow resolver: a pointer
+is for machine readers, and a prompt inside the producing run keeps the
+`$ARTIFACTS_DIR/<path>` string, which is the same file on disk.
 
 ## Substitution Order
 

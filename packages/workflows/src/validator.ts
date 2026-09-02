@@ -48,7 +48,7 @@ import {
   isOutputFormatEnforced,
   isWorkflowNode,
 } from './schemas';
-import { parseWorkflow } from './loader';
+import { parseWorkflow, workflowNodeOutputFormatError } from './loader';
 import { LOOP_PREV_OUTPUT_REF_SOURCE, OUTPUT_REF_SOURCE } from './output-ref';
 import { resolveWorkflowName } from './router';
 import { visitNodeTemplateSlots } from './template-walker';
@@ -471,14 +471,24 @@ export async function validateWorkflowResources(
     // crash here.
     if (isIncludeDirective(node)) continue;
 
-    // --- Declared contract compiles (#2453) ---
-    // parseWorkflow already rejects an uncompilable `output_format` on an enforced
-    // node, so a file-fed caller never reaches this branch. It is kept for the callers
-    // that hand this pass a definition built in memory (tests, and any future
-    // synthesized or programmatically-assembled workflow), which would otherwise
-    // validate clean and then fail at the node boundary after the spend. Same
-    // predicate as the loader, so the two gates cannot disagree on an inert schema.
-    if (isOutputFormatEnforced(node) && node.output_format !== undefined) {
+    // --- Declared contract belongs to a producer, and compiles (#2453) ---
+    // parseWorkflow already rejects both an `output_format` on a `workflow:` node and
+    // an uncompilable one on an enforced node, so a file-fed caller never reaches these
+    // branches. They are kept for the callers that hand this pass a definition built in
+    // memory (tests, and any future synthesized or programmatically-assembled
+    // workflow), which would otherwise validate clean and then fail at the node
+    // boundary after the spend. Same predicate as the loader, so the two gates cannot
+    // disagree on an inert schema.
+    const ownershipError = workflowNodeOutputFormatError(node);
+    if (ownershipError !== null) {
+      issues.push({
+        level: 'error',
+        nodeId: node.id,
+        field: 'output_format',
+        message: ownershipError,
+        hint: "Move the schema to the child workflow's returns: node — its declared fields travel back with the result.",
+      });
+    } else if (isOutputFormatEnforced(node) && node.output_format !== undefined) {
       const compileError = compileOutputSchema(node.output_format);
       if (compileError !== null) {
         issues.push({

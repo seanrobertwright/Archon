@@ -11,8 +11,8 @@ import {
 } from 'bun:test';
 import { mkdir, writeFile, rm, readFile } from 'fs/promises';
 import { removeTempTree } from '@archon/paths/test-utils';
-import { unlinkSync } from 'fs';
-import { join } from 'path';
+import { existsSync, unlinkSync } from 'fs';
+import { join, normalize, sep } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
 import { RATE_LIMIT_MAX_RETRIES } from './executor-shared';
@@ -34,6 +34,12 @@ const mockLogger = {
 const mockCaptureWorkflowCompleted = mock<typeof import('@archon/paths').captureWorkflowCompleted>(
   _props => {}
 );
+/**
+ * The Archon home the artifact-pointer gate (#2453) resolves run artifact roots under.
+ * Mutable so the pointer suite can point it at its own temp tree; every other suite in
+ * this file leaves it on the unreachable default, where no pointer can validate.
+ */
+let mockArtifactHome = '/nonexistent/home';
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   getCommandFolderSearchPaths: (folder?: string) => {
@@ -47,6 +53,13 @@ mock.module('@archon/paths', () => ({
   getHomeWorkflowsPath: () => '/nonexistent/home/workflows',
   getLegacyHomeWorkflowsPath: () => '/nonexistent/home/.archon/workflows',
   getArchonHome: () => '/nonexistent/home',
+  // Real semantics, rooted at the mutable fake home above, so the artifact-pointer
+  // containment rules are exercised rather than stubbed away.
+  isInsideArchonHome: (candidate: string): boolean =>
+    normalize(candidate) === normalize(mockArtifactHome) ||
+    normalize(candidate).startsWith(normalize(mockArtifactHome) + sep),
+  getRunArtifactsDirForRoot: (root: string, runId: string): string =>
+    join(root, 'artifacts', 'runs', runId),
   // Telemetry is fire-and-forget; mock as a no-op so terminal sites can call it.
   // Hoisted so tests can assert outcome / exit_reason at each terminal site.
   captureWorkflowCompleted: mockCaptureWorkflowCompleted,
@@ -27398,172 +27411,6 @@ describe('executeDagWorkflow -- gate pause vs external transition (#1123)', () =
     expect(store.completeWorkflowRun).not.toHaveBeenCalled();
   });
 
-  describe('workflow: declared output_format vs the child terminal output (#2774)', () => {
-    const setupCompletedChild = (
-      metadata: Record<string, unknown>
-    ): ReturnType<typeof createMockStore> => {
-      const store = createMockStore();
-      store.findChildRuns = mock(() =>
-        Promise.resolve([
-          makeWorkflowRun('child-run-2774', {
-            workflow_name: 'child-wf',
-            status: 'completed',
-            metadata: { parent_node_id: 'sub', ...metadata },
-          }),
-        ])
-      );
-      return store;
-    };
-
-    const runSubNode = async (
-      store: ReturnType<typeof createMockStore>,
-      outputFormat?: Record<string, unknown>
-    ) => {
-      const mockDeps = createMockDeps(store);
-      const platform = createMockPlatform();
-      const workflowRun = makeWorkflowRun();
-      await executeDagWorkflow(
-        dagOptions({
-          deps: mockDeps,
-          platform,
-          conversationId: 'conv-subrun-contract',
-          cwd: testDir,
-          workflow: {
-            name: 'subrun-contract',
-            nodes: [
-              {
-                id: 'sub',
-                kind: 'workflow',
-                workflow: 'child-wf',
-                ...(outputFormat !== undefined ? { output_format: outputFormat } : {}),
-              } as unknown as DagNode,
-            ],
-          },
-          workflowRun,
-          runChildWorkflow: async () => {
-            throw new Error('runChildWorkflow should not be called — a completed child exists');
-          },
-        })
-      );
-      return platform;
-    };
-
-    const eventTypes = (store: ReturnType<typeof createMockStore>): string[] =>
-      (store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>).mock.calls.map(
-        (c: unknown[]) => (c[0] as { event_type: string }).event_type
-      );
-
-    beforeEach(async () => {
-      testDir = join(
-        tmpdir(),
-        `dag-subrun-contract-${Date.now()}-${Math.random().toString(36).slice(2)}`
-      );
-      await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
-    });
-
-    afterEach(async () => {
-      try {
-        await rm(testDir, { recursive: true, force: true });
-      } catch {
-        // ignore cleanup errors
-      }
-    });
-
-    it('fails the node when structuredOutput violates the declared schema', async () => {
-      const store = setupCompletedChild({
-        summary_value: { verdict: 42 },
-      });
-
-      await runSubNode(store, {
-        type: 'object',
-        properties: { verdict: { type: 'string' } },
-        required: ['verdict'],
-      });
-
-      expect(eventTypes(store)).toContain('node_failed');
-      expect(eventTypes(store)).not.toContain('node_completed');
-      expect(store.failWorkflowRun).toHaveBeenCalled();
-      const failed = (
-        store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
-      ).mock.calls
-        .map((c: unknown[]) => c[0] as { event_type: string; data: { error: string } })
-        .filter(c => c.event_type === 'node_failed');
-      expect(failed.length).toBeGreaterThan(0);
-      for (const call of failed) {
-        expect(call.data.error).toContain("Node 'sub'");
-        expect(call.data.error).toContain("sub-run 'child-wf'");
-        expect(call.data.error).toContain('/verdict');
-        expect(call.data.error).toContain('must be string');
-        expect(call.data.error).toContain('Received: object');
-      }
-    });
-
-    it('completes when text-only output parses to a valid object', async () => {
-      const store = setupCompletedChild({
-        summary: JSON.stringify({ verdict: 'SHIP' }),
-      });
-
-      await runSubNode(store, {
-        type: 'object',
-        properties: { verdict: { type: 'string' } },
-        required: ['verdict'],
-      });
-
-      expect(eventTypes(store)).toContain('node_completed');
-      expect(eventTypes(store)).not.toContain('node_failed');
-      expect(store.failWorkflowRun).not.toHaveBeenCalled();
-    });
-
-    it('fails when text-only output is not JSON against an object-typed schema', async () => {
-      const store = setupCompletedChild({ summary: 'plain prose summary' });
-
-      await runSubNode(store, {
-        type: 'object',
-        properties: { verdict: { type: 'string' } },
-      });
-
-      expect(eventTypes(store)).toContain('node_failed');
-      const failed = (
-        store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
-      ).mock.calls
-        .map((c: unknown[]) => c[0] as { event_type: string; data: { error: string } })
-        .filter(c => c.event_type === 'node_failed');
-      expect(failed.some(c => c.data.error.includes('Received: string'))).toBe(true);
-    });
-
-    it('leaves nodes without output_format untouched', async () => {
-      const store = setupCompletedChild({ summary: 'plain prose summary' });
-
-      await runSubNode(store);
-
-      expect(eventTypes(store)).toContain('node_completed');
-      expect(eventTypes(store)).not.toContain('node_failed');
-    });
-
-    it('fails the node on an uncompilable schema (#2453)', async () => {
-      // The loader rejects this schema before a run starts; reaching the boundary
-      // means the definition bypassed it, and a contract nobody can enforce must
-      // not certify the child's value by doing nothing.
-      const store = setupCompletedChild({ summary_value: { verdict: 'SHIP' } });
-
-      await runSubNode(store, {
-        type: 'object',
-        properties: { verdict: { $ref: '#/definitions/missing' } },
-      });
-
-      expect(eventTypes(store)).toContain('node_failed');
-      expect(eventTypes(store)).not.toContain('node_completed');
-      const failed = (
-        store.createWorkflowEvent as Mock<IWorkflowStore['createWorkflowEvent']>
-      ).mock.calls
-        .map((c: unknown[]) => c[0] as { event_type: string; data: { error: string } })
-        .filter(c => c.event_type === 'node_failed');
-      expect(failed.length).toBeGreaterThan(0);
-      expect(failed[0].data.error).toContain("Node 'sub'");
-      expect(failed[0].data.error).toContain('output_format schema cannot be compiled');
-    });
-  });
-
   it('gate pause failure with the run still running stays a genuine node failure', async () => {
     const store = createMockStore();
     // Pause fails but the run is still 'running' (default mock) — a real store
@@ -30008,6 +29855,534 @@ describe('exec result contracts (#2453)', () => {
     expect(completed?.data?.structured_output).toBeUndefined();
     expect(String(completed?.data?.node_output)).toBe('  not json  ');
     expect(prompts).toEqual(['raw=[  not json  ]']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2453 — a result may point at a file instead of carrying it. The producing node
+// proves every reserved `archon_artifact` pointer names its own run and a real
+// regular file under that run's artifacts directory, before the value is
+// persisted, and keeps the value a run id plus a relative path.
+// ---------------------------------------------------------------------------
+
+describe('artifact pointers (#2453)', () => {
+  let testDir: string;
+  let outputRoot: string;
+  const originalArtifactHome = mockArtifactHome;
+
+  type PersistedEvent = {
+    event_type: string;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  };
+
+  const POINTER_SCHEMA = {
+    type: 'object',
+    properties: {
+      ready: { type: 'boolean' },
+      plan: {
+        type: 'object',
+        properties: {
+          type: { const: 'archon_artifact' },
+          run_id: { type: 'string' },
+          path: { type: 'string' },
+        },
+        required: ['type', 'run_id', 'path'],
+      },
+    },
+    required: ['ready', 'plan'],
+  };
+
+  const RUN_ID = 'pointer-run';
+  const result = (runId: string, path: string): Record<string, unknown> => ({
+    ready: true,
+    plan: { type: 'archon_artifact', run_id: runId, path },
+  });
+
+  function artifactsDir(runId: string): string {
+    return join(outputRoot, 'artifacts', 'runs', runId);
+  }
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-pointer-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    outputRoot = join(testDir, 'workspaces', '_cwd', 'proj');
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+    mockArtifactHome = testDir;
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+  });
+
+  afterEach(async () => {
+    mockArtifactHome = originalArtifactHome;
+    await removeTempTree(testDir);
+  });
+
+  async function writeArtifact(runId: string, relPath: string): Promise<void> {
+    await mkdir(artifactsDir(runId), { recursive: true });
+    await writeFile(join(artifactsDir(runId), relPath), '# the full plan');
+  }
+
+  /** A script producer emitting `value`, and a consumer reading the pointer field. */
+  function pointerWorkflow(value: Record<string, unknown>): WorkflowDefinition {
+    return {
+      name: 'pointer-contract',
+      description: 'a result that points at a file instead of carrying it',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'producer',
+          runtime: 'bun',
+          script: `process.stdout.write(${JSON.stringify(JSON.stringify(value))});`,
+          output_format: POINTER_SCHEMA,
+        }),
+        dagNodeSchema.parse({
+          id: 'consumer',
+          prompt: 'plan=[$producer.output.plan]',
+          depends_on: ['producer'],
+        }),
+      ],
+    };
+  }
+
+  async function runPointerDag(
+    workflow: WorkflowDefinition,
+    runId: string,
+    options?: {
+      store?: MockWorkflowStore;
+      priorCompletedNodes?: Map<string, PersistedNodeOutput>;
+    }
+  ): Promise<{ events: PersistedEvent[]; prompts: string[] }> {
+    const prompts: string[] = [];
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      prompts.push(prompt);
+      yield { type: 'assistant', content: 'consumer done' };
+      yield { type: 'result', sessionId: 'sid-cons' };
+    });
+    const store = options?.store ?? createMockStore();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        conversationId: 'conv-2453-pointer',
+        cwd: testDir,
+        workflow,
+        workflowRun: makeWorkflowRun(runId, { output_root: outputRoot }),
+        priorCompletedNodes: options?.priorCompletedNodes,
+      })
+    );
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as PersistedEvent
+    );
+    return { events, prompts };
+  }
+
+  const producerCompletion = (events: PersistedEvent[]): PersistedEvent | undefined =>
+    events.find(e => e.event_type === 'node_completed' && e.step_name === 'producer');
+  const producerError = (events: PersistedEvent[]): string =>
+    String(
+      (
+        events.find(e => e.event_type === 'node_failed' && e.step_name === 'producer')?.data as
+          | { error?: string }
+          | undefined
+      )?.error
+    );
+
+  it('a pointer at the producing run survives to the consumer as a run id and relative path', async () => {
+    await writeArtifact(RUN_ID, 'plan.md');
+
+    const { events, prompts } = await runPointerDag(
+      pointerWorkflow(result(RUN_ID, 'plan.md')),
+      RUN_ID
+    );
+
+    expect(producerCompletion(events)?.data?.structured_output).toEqual(result(RUN_ID, 'plan.md'));
+    // Never expanded into an absolute path, and never replaced by the file contents.
+    expect(prompts).toEqual([
+      `plan=[{"type":"archon_artifact","run_id":"${RUN_ID}","path":"plan.md"}]`,
+    ]);
+  });
+
+  it('a pointer whose file does not exist fails the producing node before node_completed', async () => {
+    await mkdir(artifactsDir(RUN_ID), { recursive: true });
+
+    const { events, prompts } = await runPointerDag(
+      pointerWorkflow(result(RUN_ID, 'plan.md')),
+      RUN_ID
+    );
+
+    expect(producerCompletion(events)).toBeUndefined();
+    expect(producerError(events)).toContain('refers to a file that does not exist');
+    expect(prompts).toEqual([]);
+  });
+
+  it('a traversal pointer fails the producing node naming the run, the path, and the rule', async () => {
+    await writeArtifact(RUN_ID, 'plan.md');
+
+    const { events } = await runPointerDag(
+      pointerWorkflow(result(RUN_ID, '../../plan.md')),
+      RUN_ID
+    );
+
+    const error = producerError(events);
+    expect(error).toContain("Script node 'producer'");
+    expect(error).toContain(`run '${RUN_ID}'`);
+    expect(error).toContain("path '../../plan.md'");
+    expect(error).toContain("may not contain '..' path segments");
+  });
+
+  it('a pointer at another run fails the producing node even when that file exists', async () => {
+    await writeArtifact('some-other-run', 'plan.md');
+    const store = createMockStore();
+
+    const { events } = await runPointerDag(
+      pointerWorkflow(result('some-other-run', 'plan.md')),
+      RUN_ID,
+      { store }
+    );
+
+    // Own run only: the producer never asks the store about the other run.
+    expect(producerError(events)).toContain(
+      "a result may only point at its own run's artifacts today"
+    );
+    expect(store.getWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('a validated pointer resolves identically after a cold resume', async () => {
+    await writeArtifact(RUN_ID, 'plan.md');
+    const fresh = await runPointerDag(pointerWorkflow(result(RUN_ID, 'plan.md')), RUN_ID);
+    const completed = producerCompletion(fresh.events);
+
+    const resumed = await runPointerDag(pointerWorkflow(result(RUN_ID, 'plan.md')), RUN_ID, {
+      priorCompletedNodes: new Map<string, PersistedNodeOutput>([
+        [
+          'producer',
+          {
+            output: String(completed?.data?.node_output),
+            structuredOutput: completed?.data?.structured_output,
+          },
+        ],
+      ]),
+    });
+
+    expect(resumed.prompts).toEqual(fresh.prompts);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2453 — the composed proof. One run carries a result contract across every
+// surface the earlier phases delivered: a `script:` node certifies its own stdout,
+// the result points at a file instead of carrying it, an `include:` alias exposes
+// that contract to the parent, `fan_out.items` consumes one of its declared fields
+// as a real array, each instance certifies its own per-item result, and a cold
+// resume reproduces all of it. This is the executable twin of the reference fixture
+// `.archon/workflows/test-workflows/e2e-contract-fanout.yaml`.
+// ---------------------------------------------------------------------------
+
+describe('a result contract survives the whole composed path (#2453)', () => {
+  let testDir: string;
+  let outputRoot: string;
+  let runArtifactsDir: string;
+  const originalArtifactHome = mockArtifactHome;
+
+  const RUN_ID = 'composed-contract-run';
+  const UNITS = [
+    { id: 'unit-a', title: 'first unit of work' },
+    { id: 'unit-b', title: 'second unit of work' },
+  ];
+  const POINTER = { type: 'archon_artifact', run_id: RUN_ID, path: 'plan.md' };
+  const PLAN_RESULT = { units: UNITS, plan: POINTER };
+  // Each instance points at the per-item file it wrote. Instances run INSIDE this run,
+  // so every pointer names this run — the only run a producer may name.
+  const AGGREGATE = UNITS.map(unit => ({
+    id: unit.id,
+    ok: true,
+    report: { type: 'archon_artifact', run_id: RUN_ID, path: `units/${unit.id}.md` },
+  }));
+
+  type PersistedEvent = {
+    event_type: string;
+    step_name?: string;
+    data?: Record<string, unknown>;
+  };
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-composed-contract-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    outputRoot = join(testDir, 'workspaces', '_cwd', 'proj');
+    runArtifactsDir = join(outputRoot, 'artifacts', 'runs', RUN_ID);
+    await mkdir(join(testDir, '.archon', 'workflows'), { recursive: true });
+    // The run's own artifacts directory, which the plan script writes into and its
+    // pointer then names — the same directory the pointer gate resolves independently
+    // from the run's persisted `output_root`.
+    await mkdir(runArtifactsDir, { recursive: true });
+    mockArtifactHome = testDir;
+    mockSendQueryDag.mockClear();
+    mockGetAgentProviderDag.mockClear();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+
+    // The block whose `returns:` node certifies the workflow's result. A deterministic
+    // producer (Phase 2) writing the large artifact and returning a small value that
+    // points at it (Phase 4).
+    await writeFile(
+      join(testDir, '.archon', 'workflows', 'plan-block.yaml'),
+      `
+name: plan-block
+description: certifies a result carrying a unit list and a pointer at the full plan
+mutates_checkout: false
+returns: build
+nodes:
+  - id: build
+    runtime: bun
+    script: |
+      import { writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      writeFileSync(join(process.env.ARTIFACTS_DIR, 'plan.md'), '# the full plan');
+      console.log(
+        JSON.stringify({
+          units: ${JSON.stringify(UNITS)},
+          plan: { type: 'archon_artifact', run_id: process.env.WORKFLOW_ID, path: 'plan.md' },
+        })
+      );
+    output_format:
+      type: object
+      properties:
+        units:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              title: { type: string }
+            required: [id, title]
+        plan:
+          type: object
+          properties:
+            type: { const: archon_artifact }
+            run_id: { type: string }
+            path: { type: string }
+          required: [type, run_id, path]
+      required: [units, plan]
+`
+    );
+
+    // The per-item body. It owns its own contract, so the aggregate is an array of
+    // validated objects rather than an array of prose — each pointing at a per-item file
+    // the instance wrote, proved at that producer against the run it runs in.
+    await writeFile(
+      join(testDir, '.archon', 'workflows', 'unit-block.yaml'),
+      `
+name: unit-block
+description: one instance per unit, certifying its own per-item result
+mutates_checkout: false
+inputs:
+  unit:
+    required: true
+returns: check
+nodes:
+  - id: check
+    runtime: bun
+    script: |
+      import { mkdirSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      const unit = JSON.parse(process.env.INPUTS_UNIT);
+      mkdirSync(join(process.env.ARTIFACTS_DIR, 'units'), { recursive: true });
+      writeFileSync(join(process.env.ARTIFACTS_DIR, 'units', unit.id + '.md'), '# ' + unit.title);
+      console.log(JSON.stringify({
+        id: unit.id,
+        ok: typeof unit.title === 'string',
+        report: { type: 'archon_artifact', run_id: process.env.WORKFLOW_ID, path: 'units/' + unit.id + '.md' },
+      }));
+    output_format:
+      type: object
+      properties:
+        id: { type: string }
+        ok: { type: boolean }
+        report:
+          type: object
+          properties:
+            type: { const: archon_artifact }
+            run_id: { type: string }
+            path: { type: string }
+          required: [type, run_id, path]
+      required: [id, ok, report]
+`
+    );
+
+    await writeFile(
+      join(testDir, '.archon', 'workflows', 'composed-parent.yaml'),
+      `
+name: composed-parent
+description: reads the included block's contract and fans a composed body out over it
+mutates_checkout: false
+nodes:
+  - id: plan
+    include: plan-block
+  - id: work
+    include: unit-block
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output.units"
+      as: unit
+      max_parallel: 2
+      join: all_success
+  - id: report
+    prompt: "aggregate=$work.output pointer=$plan.output.plan"
+    depends_on: [work]
+`
+    );
+  });
+
+  afterEach(async () => {
+    mockArtifactHome = originalArtifactHome;
+    await removeTempTree(testDir);
+  });
+
+  /** The flattened parent, exactly as discovery hands it to the executor. */
+  async function expandedParent(): Promise<ResolvedWorkflow> {
+    const discovered = await discoverWorkflows(testDir, { loadDefaults: false });
+    expect(discovered.errors).toEqual([]);
+    const parent = discovered.workflows.find(w => w.workflow.name === 'composed-parent');
+    if (!parent) throw new Error('composed-parent was not discovered');
+    return parent.workflow;
+  }
+
+  async function runComposed(
+    priorCompletedNodes?: Map<string, PersistedNodeOutput>
+  ): Promise<{ events: PersistedEvent[]; prompts: string[] }> {
+    const prompts: string[] = [];
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      prompts.push(prompt);
+      yield { type: 'assistant', content: 'reported' };
+      yield { type: 'result', sessionId: 'sid-report' };
+    });
+    const store = createMockStore();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        conversationId: 'conv-2453-composed',
+        cwd: testDir,
+        workflow: await expandedParent(),
+        workflowRun: makeWorkflowRun(RUN_ID, { output_root: outputRoot }),
+        artifactsDir: runArtifactsDir,
+        priorCompletedNodes,
+      })
+    );
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as PersistedEvent
+    );
+    return { events, prompts };
+  }
+
+  const completionOf = (events: PersistedEvent[], step: string): PersistedEvent | undefined =>
+    events.find(e => e.event_type === 'node_completed' && e.step_name === step);
+
+  it('certifies a script result, exposes it through an include alias, and fans out over a declared field', async () => {
+    const { events, prompts } = await runComposed();
+
+    // The alias resolved to the included block's selected node, which certified its
+    // own stdout: canonical text plus the logical value, pointer intact.
+    const plan = completionOf(events, 'plan__build');
+    expect(plan?.data?.structured_output).toEqual(PLAN_RESULT);
+    expect(String(plan?.data?.node_output)).toBe(JSON.stringify(PLAN_RESULT));
+
+    // `fan_out.items` read the DECLARED `units` field as a real array — one instance
+    // per element, each certifying its own result.
+    const instances = events.filter(
+      e =>
+        e.event_type === 'node_completed' &&
+        (e.step_name ?? '').startsWith(`${composeScope('work')}__`) &&
+        (e.step_name ?? '').endsWith('__check')
+    );
+    expect(instances).toHaveLength(2);
+    expect(instances.map(e => e.data?.structured_output)).toEqual(
+      expect.arrayContaining(AGGREGATE)
+    );
+
+    // The wrapper aggregate is the ordered logical array, serialized exactly once, and
+    // it relays each instance's pointer unrewritten: one per item, naming this run and
+    // the relative path the instance wrote — a real file under this run's artifacts.
+    const wrapper = completionOf(events, 'work');
+    expect(wrapper?.data?.structured_output).toEqual(AGGREGATE);
+    expect(JSON.parse(String(wrapper?.data?.node_output))).toEqual(AGGREGATE);
+    for (const unit of UNITS) {
+      expect(existsSync(join(runArtifactsDir, 'units', `${unit.id}.md`))).toBe(true);
+    }
+
+    // Downstream, the aggregate is one JSON array and the pointer is still a run id
+    // plus a relative path — never expanded, never replaced by the file's contents.
+    expect(prompts).toEqual([
+      `aggregate=${JSON.stringify(AGGREGATE)} pointer=${JSON.stringify(POINTER)}`,
+    ]);
+  });
+
+  it('reproduces the same downstream view after a cold resume', async () => {
+    const fresh = await runComposed();
+    const plan = completionOf(fresh.events, 'plan__build');
+
+    // Only what an event row carries: the text and its logical sibling. Field
+    // authorization is re-derived from the loaded block, which is what keeps
+    // `$plan.output.units` a declared array rather than a lenient text parse.
+    const resumed = await runComposed(
+      new Map<string, PersistedNodeOutput>([
+        [
+          'plan__build',
+          {
+            output: String(plan?.data?.node_output),
+            structuredOutput: plan?.data?.structured_output,
+          },
+        ],
+      ])
+    );
+
+    expect(resumed.prompts).toEqual(fresh.prompts);
+    expect(completionOf(resumed.events, 'work')?.data?.structured_output).toEqual(AGGREGATE);
+    // The producer was not re-run; its contract rode the prior-success re-emit forward.
+    expect(completionOf(resumed.events, 'plan__build')).toBeUndefined();
+    const replayed = resumed.events.find(
+      e => e.event_type === 'node_skipped_prior_success' && e.step_name === 'plan__build'
+    );
+    expect(replayed?.data?.structured_output).toEqual(PLAN_RESULT);
+  });
+
+  it('fails the consuming node when the fan-out reads a field the contract never declared', async () => {
+    await writeFile(
+      join(testDir, '.archon', 'workflows', 'composed-parent.yaml'),
+      `
+name: composed-parent
+description: fans out over a field the included block does not declare
+mutates_checkout: false
+nodes:
+  - id: plan
+    include: plan-block
+  - id: work
+    include: unit-block
+    depends_on: [plan]
+    fan_out:
+      items: "$plan.output.tasks"
+      as: unit
+      max_parallel: 2
+      join: all_success
+`
+    );
+
+    const { events } = await runComposed();
+
+    const failed = events.find(e => e.event_type === 'node_failed' && e.step_name === 'work');
+    const error = String((failed?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain("fan_out.items on 'work' could not be resolved to a JSON array");
+    expect(error).toContain("references field 'tasks'");
+    expect(events.some(e => (e.step_name ?? '').startsWith(`${composeScope('work')}__`))).toBe(
+      false
+    );
   });
 });
 

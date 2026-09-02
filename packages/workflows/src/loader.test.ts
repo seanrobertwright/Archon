@@ -8169,11 +8169,6 @@ nodes:
     depends_on: [plan]
     fan_out:
       items: "$plan.output.tasks"
-    output_format:
-      type: object
-      properties:
-        green: { type: boolean }
-      required: [green]
 `,
       'fan-out-outcome.yaml'
     );
@@ -8659,6 +8654,30 @@ nodes:
 // ---------------------------------------------------------------------------
 
 describe('output_format compiles at load time (#2453)', () => {
+  it('rejects output_format on a workflow: node, naming the child returns: node as the owner', () => {
+    const { workflow, error } = parseWorkflow(
+      `
+name: caller-schema
+description: the caller repeats a contract the child already owns
+nodes:
+  - id: sub
+    workflow: child-workflow
+    output_format:
+      type: object
+      properties:
+        green: { type: boolean }
+      required: [green]
+`,
+      'caller-schema.yaml'
+    );
+
+    expect(workflow).toBeNull();
+    expect(error?.errorType).toBe('validation_error');
+    expect(error?.error).toBe(
+      "Node 'sub' declares output_format on a workflow: node; the result contract belongs to the child's returns: node — declare it there"
+    );
+  });
+
   it('rejects an output_format ajv cannot compile, naming the node', () => {
     const { workflow, error } = parseWorkflow(
       `
@@ -8705,27 +8724,6 @@ nodes:
     );
     expect(result.error).toBeNull();
     expect(result.workflow?.nodes).toHaveLength(1);
-  });
-
-  it('rejects an uncompilable output_format on a workflow: node', () => {
-    // A sub-run node's schema is enforced at runtime (the parent validates the child's
-    // value against it), so it must compile at load like any other enforced contract.
-    const result = parseWorkflow(
-      `
-name: subrun-broken-contract
-description: A workflow node whose caller schema cannot compile
-nodes:
-  - id: sub
-    workflow: some-child-workflow
-    output_format:
-      type: object
-      properties: { ready: { $ref: '#/$defs/missing' } }
-`,
-      'subrun-broken-contract.yaml'
-    );
-    expect(result.error?.error).toContain(
-      "Node 'sub' declares an output_format that cannot be compiled"
-    );
   });
 
   it('rejects an uncompilable output_format on a loop_group body node', () => {
