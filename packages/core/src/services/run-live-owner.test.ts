@@ -188,7 +188,7 @@ describe('run live owner', () => {
     }
   });
 
-  test('refuses a committed stop when the owner closes before acknowledging it', async () => {
+  test('refuses a committed stop when the owner disconnects before acknowledging it', async () => {
     const runId = `close-before-ready-${crypto.randomUUID()}`;
     const path = runLiveOwnerPath(runId);
     const server = createServer(socket => {
@@ -200,7 +200,7 @@ describe('run live owner', () => {
           socket.write(`${JSON.stringify({ kind: 'detached', pid: 12345 })}\n`);
           request = request.replace('stop\n', '');
         }
-        if (request.includes('terminate\n')) socket.end();
+        if (request.includes('terminate\n')) socket.destroy();
       });
     });
     await listen(server, path);
