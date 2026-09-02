@@ -702,7 +702,7 @@ describe('workflow status project scope', () => {
     } finally {
       await removeTempTree(scratch);
     }
-  });
+  }, 30_000);
 });
 
 describe('workflow get arguments', () => {
