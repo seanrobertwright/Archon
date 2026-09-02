@@ -2344,15 +2344,18 @@ where the value comes from.
 |---|---|---|
 | Where the producer runs | This run, after flattening | A governed child run |
 | What `$node.output.field` is authorized by | The included block's `returns:` node — the alias is rewritten to it at load time, so there is no boundary left | The child's `returns:` node, whose declared field names travel back with the result |
-| Caller-side `output_format` | Ignored with a load warning; there is nothing to assert against | Optional receiver assertion (see below) |
+| Caller-side `output_format` | Ignored with a load warning; there is nothing to assert against | A load error naming the child's `returns:` node; there is nothing to assert against |
 | After a cold resume | Re-derived from the loaded block, exactly like any other node | Restored from the persisted result, so a parent that declares nothing keeps full field access |
 
-A `workflow:` node may still declare its own `output_format`. It is a **receiver
-assertion**: the value the child returned must satisfy it as well, which is useful when a
-caller wants to require more than the child promises. It cannot broaden the contract — a
-caller schema naming a field the child does not declare fails the node and names both sides.
-When the child is schemaless (no `output_format` on its selected node, or an older run), the
-caller schema keeps its original role as the field contract.
+A `workflow:` node cannot declare `output_format`. The loader rejects the file:
+
+```text
+Node 'sub' declares output_format on a workflow: node; the result contract belongs to the child's returns: node — declare it there
+```
+
+The child's contract is the only one. `$sub.output.field` is strict exactly when the child's
+`returns:` node declares a schema, and a schemaless child (no `output_format` on its selected
+node, or an older run) carries no field contract — the caller cannot add one.
 
 A fan-out node is the one exception to "the producer declares it". `$fan.output` is an
 engine-owned ordered array; the per-item contract belongs to each block or child, and field
@@ -2385,17 +2388,20 @@ nodes:
 { "ready": true, "plan": { "type": "archon_artifact", "run_id": "$WORKFLOW_ID", "path": "plan.md" } }
 ```
 
-`type: "archon_artifact"` is reserved. Before the value is persisted, the engine proves each
-pointer addresses a real regular file inside the named run's artifacts directory, and that
-the run is one this run may see: itself, an ancestor, a descendant, or a run it adopted with
-`--adopt`. An absolute path, a `..` segment, a symlink leading out of the directory, a
-missing file, or an unrelated run fails the producing node, naming the run, the path, and
-the rule.
+`type: "archon_artifact"` is reserved. Before the value is persisted, the **producing node**
+proves each pointer names its own run (`run_id` is `$WORKFLOW_ID`) and addresses a regular
+file that exists under that run's artifacts directory. An absolute path, a `..` segment, a
+missing file, a directory, or any other run's id fails the producing node, naming the run,
+the path, and the rule. The check runs once, at the producer: a `workflow:` parent and a
+fan-out aggregate relay the child's value unchanged, because the child already certified it
+against the only run it may name.
 
 The value stays a run id plus a relative path everywhere — in events, in the API, and after a
-resume. The engine never expands it into an absolute path and never loads the file. To read
-it, use the two fields directly: `GET /api/artifacts/<run_id>/<path>` serves exactly that
-file, and inside the producing run `$ARTIFACTS_DIR/<path>` is the same file on disk. See
+resume. The engine never expands it into an absolute path and never loads the file, and there
+is no in-workflow resolver: a pointer is for **machine readers**, and
+`GET /api/artifacts/<run_id>/<path>` serves exactly that file, owning the read-side checks
+(containment against the real path, and who may see that run). A prompt inside the producing
+run keeps using the `$ARTIFACTS_DIR/<path>` string, which is the same file on disk. See
 [Artifact pointers](/reference/variables/#artifact-pointers-in-a-result) for the full rule
 set.
 
