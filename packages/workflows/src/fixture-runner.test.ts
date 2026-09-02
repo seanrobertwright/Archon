@@ -769,17 +769,24 @@ describe('runFixtures', () => {
   // R1: this fixtures/ dir was already found by the walk, so a read failure is a real
   // fault, not an absence. Swallowing it would let a run exit 0 having skipped a
   // directory it was asked to certify.
-  it('propagates a fixtures-directory read failure instead of reporting no fixtures', async () => {
-    const cwd = makeTempProject();
-    writeWorkflowDirs(cwd, ['pack/locked']);
-    const fixturesDir = join(cwd, '.archon', 'workflows', 'pack', 'locked', 'fixtures');
-    chmodSync(fixturesDir, 0o000);
-    try {
-      await expect(runFixtures({ workflows: [], cwd })).rejects.toThrow();
-    } finally {
-      chmodSync(fixturesDir, 0o755);
+  //
+  // POSIX-only: the unreadable directory is created with chmod 000, which win32 does
+  // not enforce for directory reads — the precondition cannot be built there, so the
+  // test would assert nothing. Same treatment as the permission cases in git.test.ts.
+  it.skipIf(process.platform === 'win32')(
+    'propagates a fixtures-directory read failure instead of reporting no fixtures',
+    async () => {
+      const cwd = makeTempProject();
+      writeWorkflowDirs(cwd, ['pack/locked']);
+      const fixturesDir = join(cwd, '.archon', 'workflows', 'pack', 'locked', 'fixtures');
+      chmodSync(fixturesDir, 0o000);
+      try {
+        await expect(runFixtures({ workflows: [], cwd })).rejects.toThrow();
+      } finally {
+        chmodSync(fixturesDir, 0o755);
+      }
     }
-  });
+  );
 
   it('reports fixtures in label order, not filesystem order', async () => {
     const cwd = makeTempProject();
