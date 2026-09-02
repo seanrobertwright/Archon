@@ -1296,6 +1296,115 @@ describe('WorktreeProvider', () => {
       );
     });
 
+    test('absorbs ref-lock race on concurrent fork-PR launches', async () => {
+      // Two concurrent fork-PR launches race on the local branch refspec's
+      // ref lock (refs/heads/pr-42-review). The first attempt per launch fails
+      // with the lock-race error; the bounded retry absorbs it.
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+
+      const raceText =
+        "error: cannot lock ref 'refs/heads/pr-42-review': is at de581e24 but expected 8eaa8d42\n" +
+        '! 8eaa8d420..de581e24b pr-42-review -> pr-42-review (unable to update local ref)';
+      const raceError = new Error(raceText) as Error & { stderr?: string };
+      raceError.stderr = raceText;
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch') && args.some(a => a.includes('pull/42/head:pr-42-review'))) {
+          fetchCalls++;
+          if (fetchCalls <= 2) {
+            throw raceError;
+          }
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await Promise.all([provider.create(request), provider.create(request)]);
+
+      expect(fetchCalls).toBeGreaterThan(2);
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        expect.arrayContaining([
+          '-C',
+          '/workspace/repo',
+          'worktree',
+          'add',
+          expect.any(String),
+          'pr-42-review',
+        ]),
+        expect.any(Object)
+      );
+    });
+
+    test('exhausts the bounded budget on persistent fork-PR fetch lock-race and fails before worktree creation', async () => {
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+
+      const raceText =
+        "error: cannot lock ref 'refs/heads/pr-42-review': is at de581e24 but expected 8eaa8d42\n" +
+        '! 8eaa8d420..de581e24b pr-42-review -> pr-42-review (unable to update local ref)';
+      const raceError = new Error(raceText) as Error & { stderr?: string };
+      raceError.stderr = raceText;
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch') && args.some(a => a.includes('pull/42/head:pr-42-review'))) {
+          fetchCalls++;
+          throw raceError;
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42: Fetch origin pull/42/head:pr-42-review failed: error: cannot lock ref'
+      );
+
+      expect(fetchCalls).toBe(4); // 1 initial + 3 retries
+
+      const addCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('add');
+      });
+      expect(addCalls).toHaveLength(0);
+    });
+
+    test('does not retry non-race fork-PR fetch errors', async () => {
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch') && args.some(a => a.includes('pull/42/head:pr-42-review'))) {
+          fetchCalls++;
+          throw new Error("fatal: 'origin' does not appear to be a git repository");
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42'
+      );
+
+      expect(fetchCalls).toBe(1);
+    });
+
     test('propagates permission error when workspace sync fails during creation', async () => {
       const request: IsolationRequest = {
         codebaseId: 'cb-123',

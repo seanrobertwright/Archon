@@ -2547,6 +2547,90 @@ branch refs/heads/feature/auth
     });
   });
 
+  describe('fetchWithRefLockRetry', () => {
+    let execSpy: Mock<typeof git.execFileAsync>;
+
+    beforeEach(() => {
+      execSpy = spyOn(git, 'execFileAsync');
+    });
+
+    afterEach(() => {
+      execSpy.mockRestore();
+    });
+
+    test('retries the ref-lock race and succeeds on a later attempt', async () => {
+      const raceError = new Error(
+        "error: cannot lock ref 'refs/heads/pr-42-review': is at de581e24 but expected 8eaa8d42\n" +
+          '! 8eaa8d420..de581e24b pr-42-review -> pr-42-review (unable to update local ref)'
+      );
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        expect(args).toEqual([
+          '-C',
+          '/workspace/repo',
+          'fetch',
+          'origin',
+          'pull/42/head:pr-42-review',
+        ]);
+        fetchCalls++;
+        if (fetchCalls === 1) {
+          throw raceError;
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(
+        git.fetchWithRefLockRetry(repo('/workspace/repo'), 'origin', 'pull/42/head:pr-42-review')
+      ).resolves.toEqual({ stdout: '', stderr: '' });
+
+      expect(fetchCalls).toBe(2);
+    });
+
+    test('rethrows the original error object after exhausting the budget', async () => {
+      const raceText =
+        "error: cannot lock ref 'refs/heads/pr-42-review': is at de581e24 but expected 8eaa8d42\n" +
+        '! 8eaa8d420..de581e24b pr-42-review -> pr-42-review (unable to update local ref)';
+      const raceError = Object.assign(new Error(raceText), { stderr: 'original stderr evidence' });
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async () => {
+        fetchCalls++;
+        throw raceError;
+      });
+
+      let caught: unknown;
+      try {
+        await git.fetchWithRefLockRetry(
+          repo('/workspace/repo'),
+          'origin',
+          'pull/42/head:pr-42-review'
+        );
+      } catch (error) {
+        caught = error;
+      }
+
+      // Original object identity: stderr evidence survives for callers
+      expect(caught).toBe(raceError);
+      expect(fetchCalls).toBe(4); // 1 initial + 3 retries
+    });
+
+    test('attempts non-race errors exactly once', async () => {
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async () => {
+        fetchCalls++;
+        throw new Error("fatal: 'origin' does not appear to be a git repository");
+      });
+
+      await expect(
+        git.fetchWithRefLockRetry(repo('/workspace/repo'), 'origin', 'main')
+      ).rejects.toThrow("fatal: 'origin' does not appear to be a git repository");
+
+      expect(fetchCalls).toBe(1);
+    });
+  });
+
   describe('getDefaultRemote', () => {
     let execSpy: Mock<typeof git.execFileAsync>;
 
