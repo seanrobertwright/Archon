@@ -12831,39 +12831,32 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     const workflowRun = makeWorkflowRun();
 
     await executeDagWorkflow(
-      mockDeps,
-      platform,
-      'conv-dag',
-      testDir,
-      {
-        name: 'loop-uncompilable-schema',
-        nodes: [
-          {
-            id: 'implement',
-            kind: 'loop',
-            output_format: {
-              type: 'object',
-              properties: { done: { type: 'boolean' }, detail: { $ref: '#/$defs/missing' } },
-              required: ['done'],
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflowRun,
+        workflow: {
+          name: 'loop-uncompilable-schema',
+          nodes: [
+            {
+              id: 'implement',
+              kind: 'loop',
+              output_format: {
+                type: 'object',
+                properties: { done: { type: 'boolean' }, detail: { $ref: '#/$defs/missing' } },
+                required: ['done'],
+              },
+              loop: {
+                fresh_context: false,
+                prompt: 'Implement the change.',
+                max_iterations: 2,
+                until_field: 'done',
+              },
             },
-            loop: {
-              fresh_context: false,
-              prompt: 'Implement the change.',
-              max_iterations: 2,
-              until_field: 'done',
-            },
-          },
-        ],
-      },
-      workflowRun,
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
+          ],
+        },
+      })
     );
 
     const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
@@ -12990,34 +12983,27 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     const workflowRun = makeWorkflowRun();
 
     await executeDagWorkflow(
-      mockDeps,
-      platform,
-      'conv-dag',
-      testDir,
-      {
-        name: 'outfmt-uncompilable',
-        nodes: [
-          {
-            id: 'classify',
-            kind: 'agent',
-            source: { kind: 'inline', prompt: 'classify it' },
-            output_format: {
-              type: 'object',
-              properties: { verdict: { $ref: '#/$defs/missing' } },
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        cwd: testDir,
+        workflowRun,
+        workflow: {
+          name: 'outfmt-uncompilable',
+          nodes: [
+            {
+              id: 'classify',
+              kind: 'agent',
+              source: { kind: 'inline', prompt: 'classify it' },
+              output_format: {
+                type: 'object',
+                properties: { verdict: { $ref: '#/$defs/missing' } },
+              },
+              retry: { max_attempts: 0 },
             },
-            retry: { max_attempts: 0 },
-          },
-        ],
-      },
-      workflowRun,
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
+          ],
+        },
+      })
     );
 
     const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
@@ -29771,23 +29757,14 @@ describe('exec result contracts (#2453)', () => {
   ): Promise<PersistedEvent[]> {
     const store = createMockStore();
     await executeDagWorkflow(
-      createMockDeps(store),
-      createMockPlatform(),
-      'conv-2453',
-      testDir,
-      ready(workflow),
-      makeWorkflowRun(runId),
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'state'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig,
-      undefined,
-      undefined,
-      priorCompletedNodes
+      dagOptions({
+        deps: createMockDeps(store),
+        conversationId: 'conv-2453',
+        cwd: testDir,
+        workflow,
+        workflowRun: makeWorkflowRun(runId),
+        ...(priorCompletedNodes !== undefined ? { priorCompletedNodes } : {}),
+      })
     );
     return (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
       (call: unknown[]) => call[0] as PersistedEvent
@@ -29899,6 +29876,27 @@ describe('exec result contracts (#2453)', () => {
     const error = String((producerFailure(events)?.data as { error?: string } | undefined)?.error);
     expect(error).toContain('must be a single JSON document');
     expect(error).not.toContain('timed out after');
+  });
+
+  it('a contract failure is never retried, even under on_error: all', async () => {
+    // The failure text quotes stdout, and stdout is whatever the script printed, so the
+    // retry loop must not classify it: a transient-looking excerpt would re-run a script
+    // whose stdout is deterministically wrong. The producer says so in the type instead.
+    const attempts = join(testDir, 'contract-attempts.log').replace(/\\/g, '/');
+    const events = await runDag(
+      contractWorkflow({
+        bash: `printf 'a' >> '${attempts}'; printf '%s' 'rate limit exceeded, timed out'`,
+        // delay_ms sits at the schema minimum; it never elapses because no retry happens.
+        retry: { max_attempts: 2, delay_ms: 1000, on_error: 'all' },
+      }),
+      'contract-no-retry'
+    );
+
+    expect(producerCompletion(events)).toBeUndefined();
+    const error = String((producerFailure(events)?.data as { error?: string } | undefined)?.error);
+    expect(error).toContain('must be a single JSON document');
+    // on_error: all with max_attempts: 2 would otherwise run three times.
+    expect((await readFile(attempts, 'utf8')).length).toBe(1);
   });
 
   it('a certified exec value survives cold resume identically', async () => {

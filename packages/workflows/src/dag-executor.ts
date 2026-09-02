@@ -1101,6 +1101,12 @@ function shouldRetryNodeFailure(
   if (output.state !== 'failed') {
     return { shouldRetry: false, isTransient: false };
   }
+  // A producer that diagnosed its own output (an exec contract failure, #2453) says so
+  // in the type; its error text quotes stdout, so classifying that text would let a
+  // transient-looking excerpt re-run a script whose stdout is deterministically wrong.
+  if (output.retryable === false) {
+    return { shouldRetry: false, isTransient: false };
+  }
   const errorType = output.error ? classifyError(new Error(output.error)) : undefined;
   const isFatal = errorType === 'FATAL';
   const isTransient = errorType === 'TRANSIENT';
@@ -3884,7 +3890,12 @@ async function executeBashNode(
       error: errorMsg,
     });
 
-    return { state: 'failed', output: '', error: errorMsg };
+    return {
+      state: 'failed',
+      output: '',
+      error: errorMsg,
+      ...(contractFailure ? { retryable: false as const } : {}),
+    };
   }
 }
 
@@ -4306,7 +4317,12 @@ async function executeScriptNode(
       error: errorMsg,
     });
 
-    return { state: 'failed', output: '', error: errorMsg };
+    return {
+      state: 'failed',
+      output: '',
+      error: errorMsg,
+      ...(contractFailure ? { retryable: false as const } : {}),
+    };
   }
 }
 

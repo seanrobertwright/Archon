@@ -216,6 +216,12 @@ export const nodeOutputSchema = z.discriminatedUnion('state', [
     error: z.string(),
     structuredOutput: z.unknown().optional(),
     declaredFields: z.array(z.string()).optional(),
+    /** Set by a producer whose failure is a deterministic diagnosis of its own output
+     *  (an exec node's stdout missing its declared `output_format`): re-running yields
+     *  the same stdout, so the retry loop must not consult the error text, which quotes
+     *  that stdout and can read as transient. Only `false` is expressible: a producer can
+     *  refuse retry, never force one past a FATAL classification. */
+    retryable: z.literal(false).optional(),
   }),
   z.object({
     state: z.enum(['pending', 'skipped']),
