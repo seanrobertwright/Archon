@@ -2483,6 +2483,10 @@ async function runWorkflowWithOwnedSource(
   // the resumed-run handle to executeWorkflow below via opts. The executor no
   // longer performs implicit resume detection on its own.
   let resumable: WorkflowRun | null = null;
+  // Branch of the prior run's worktree, from the isolation record the resume path
+  // matches (or git in the worktree when no record does) — used only by the
+  // no-completed-nodes refusal to name the relaunch command (#3154).
+  let resumeBranch: string | undefined;
   if (options.resume) {
     if (!codebase) {
       if (codebaseLookupError) {
@@ -2543,6 +2547,7 @@ async function runWorkflowWithOwnedSource(
     const matchingEnv = allEnvs.find(e => e.working_path === workingCwd);
     if (matchingEnv) {
       isolationEnvId = matchingEnv.id;
+      resumeBranch = matchingEnv.branch_name;
       getLog().info(
         { envId: isolationEnvId, workingPath: workingCwd },
         'workflow.resume_env_found'
@@ -3108,8 +3113,33 @@ async function runWorkflowWithOwnedSource(
       );
     }
     if (!prepared) {
+      // Best-effort only: the message must still refuse when the branch cannot be
+      // determined, so a failed probe degrades to a <branch> placeholder.
+      if (!resumeBranch) {
+        try {
+          const { stdout } = await git.execFileAsync('git', [
+            '-C',
+            workingCwd,
+            'rev-parse',
+            '--abbrev-ref',
+            'HEAD',
+          ]);
+          const branch = stdout.trim();
+          if (branch && branch !== 'HEAD') resumeBranch = branch;
+        } catch (error) {
+          getLog().debug(
+            { err: error as Error, workingPath: workingCwd },
+            'cli.workflow_resume_branch_probe_failed'
+          );
+        }
+      }
+      const relaunch = resumeBranch
+        ? `archon workflow run ${workflowName} --branch ${resumeBranch} --supersedes ${resumable.id}`
+        : `archon workflow run ${workflowName} --branch <branch> --supersedes ${resumable.id}`;
       throw new Error(
-        `Cannot resume: the prior run for '${workflowName}' has no completed nodes and no interactive-loop state.`
+        `Cannot resume: the prior run for '${workflowName}' has no completed nodes and no interactive-loop state.\n` +
+          'Nothing can be skipped, so relaunch on the same branch instead:\n' +
+          `  ${relaunch}`
       );
     }
   }
