@@ -367,10 +367,10 @@ export function resolveNodeOutputField(
     const obj = structuredObj ?? parseOutputObject(nodeOutput.output);
     // No parseable object AT ALL is not a declared-optional field — it is a producer
     // that did not honour its schema, and it must fail exactly as loudly as the
-    // schemaless path below (#2456). Returning empty here made declaring
-    // `output_format` QUIETER than declaring nothing, which is backwards: a
-    // `workflow:` node's output_format is never validated against the child (it only
-    // populates declaredFields), so every declared field silently became ''.
+    // schemaless path below (#2456). Returning empty here made declaring a contract
+    // QUIETER than declaring nothing, which is backwards: a `workflow:` node carries no
+    // schema of its own — its declaredFields are the child's `returns:` node projection
+    // (#2453) — so every declared field would silently have become ''.
     if (obj === undefined) {
       throw new OutputRefError(nodeId, field, unparseableReason(nodeOutput.output));
     }

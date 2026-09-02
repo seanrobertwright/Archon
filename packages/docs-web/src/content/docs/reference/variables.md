@@ -242,9 +242,11 @@ later as a broken link:
 | Real file | A missing target, or a directory. |
 
 A `workflow:` parent and a fan-out aggregate relay a child's value unchanged: the child
-already proved its pointers against the only run it may name. Symlink resolution and access
-control belong to the reader — `GET /api/artifacts/<run_id>/<path>` repeats containment
-against the real path for the untrusted request and decides who may see that run.
+already proved its pointers against the only run it may name. Reachability and real-path
+checks belong to the read side by design — whether a reader may see that run, and whether
+the path still resolves inside its artifacts directory once symlinks are followed.
+`GET /api/artifacts/<run_id>/<path>` does lexical containment on the untrusted request
+today; real-path resolution at read time is not yet implemented (#3160).
 
 The value stays a run id plus a relative path in node outputs, events, sub-run results,
 fan-out aggregates, and resumed runs. Archon never rewrites it into an absolute path and

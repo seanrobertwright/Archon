@@ -2399,9 +2399,11 @@ against the only run it may name.
 The value stays a run id plus a relative path everywhere — in events, in the API, and after a
 resume. The engine never expands it into an absolute path and never loads the file, and there
 is no in-workflow resolver: a pointer is for **machine readers**, and
-`GET /api/artifacts/<run_id>/<path>` serves exactly that file, owning the read-side checks
-(containment against the real path, and who may see that run). A prompt inside the producing
-run keeps using the `$ARTIFACTS_DIR/<path>` string, which is the same file on disk. See
+`GET /api/artifacts/<run_id>/<path>` serves exactly that file. The read side owns
+reachability and real-path checks by design; that route does lexical containment today, and
+real-path resolution at read time is not yet implemented (#3160). A prompt inside the
+producing run keeps using the `$ARTIFACTS_DIR/<path>` string, which is the same file on
+disk. See
 [Artifact pointers](/reference/variables/#artifact-pointers-in-a-result) for the full rule
 set.
 

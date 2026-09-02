@@ -21,11 +21,14 @@
  * and a fan-out aggregate relay the child's value without re-validating it, because the
  * child already certified it against the only run it can address.
  *
- * The READ side owns reachability and physical resolution. A future in-workflow resolver,
- * the terminal run record, and `GET /api/artifacts/:runId/<path>` each decide whether the
- * reader may see that run and resolve the real path (symlinks included) at read time.
- * Producer-time `realpath` would not be a guarantee — the tree can change between the
- * producing node and any read — so it is deliberately not attempted here.
+ * The READ side owns reachability and real-path checks by design: whether a reader may
+ * see the named run, and whether the path still resolves inside that run's artifacts
+ * directory once symlinks are followed, are decided when the file is read — by a future
+ * in-workflow resolver, the terminal run record, or `GET /api/artifacts/:runId/<path>`.
+ * Today that route does lexical containment only; real-path resolution at read time is
+ * not yet implemented (#3160). Producer-time `realpath` would not be a guarantee — the
+ * tree can change between the producing node and any read — so it is deliberately not
+ * attempted here.
  *
  * The value stays a run id plus a RELATIVE path everywhere — in events, in APIs, and on a
  * resumed run. The engine never expands it into an absolute path and never loads the file.
@@ -139,8 +142,8 @@ async function checkPointer(
     return `${where} resolves outside this run's artifacts directory`;
   }
 
-  // Lexical containment plus existence. Physical resolution (symlinks) belongs to the read
-  // side; see the module comment.
+  // Lexical containment plus existence. Real-path resolution belongs to the read side by
+  // design and is not implemented anywhere yet (#3160); see the module comment.
   let stats: Awaited<ReturnType<typeof stat>>;
   try {
     stats = await stat(full);
