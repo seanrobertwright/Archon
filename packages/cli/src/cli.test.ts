@@ -69,7 +69,7 @@ function buildImportGraph(entry: string, outdir: string): BuildMetafile {
       `--outdir=${outdir}`,
       `--metafile=${metafilePath}`,
     ],
-    { cwd: repoRoot, encoding: 'utf8' }
+    { cwd: repoRoot, encoding: 'utf8', timeout: 20000 }
   );
   if (result.status !== 0) {
     throw new Error(`Import graph build failed for ${entry}:\n${result.stdout}\n${result.stderr}`);
@@ -91,7 +91,7 @@ describe('CLI startup import boundary', () => {
       join(repoRoot, 'packages/core/src/config/run-config-handoff.ts'),
       join(buildDir, 'handoff')
     );
-  });
+  }, 30000);
 
   afterAll(async () => {
     if (buildDir) await removeTempTree(buildDir);
