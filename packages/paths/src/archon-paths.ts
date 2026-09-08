@@ -319,8 +319,8 @@ export function getWorkflowFolderSearchPaths(): string[] {
  * the number of folder boundaries between `rootPath` and the file — so at
  * `maxDepth: 1`, files at `rootPath/file.md` (depth 0) and `rootPath/group/file.md`
  * (depth 1) are included, but `rootPath/group/sub/file.md` (depth 2) is not.
- * Default is `Infinity` (no cap) for backwards compatibility with callers that
- * want to copy arbitrary subtrees (e.g. clone handlers).
+ * Default is `Infinity` (no cap). Command consumers use `findCommandFiles`
+ * to apply the executable-command depth and duplicate-selection policy.
  *
  * Results are in a defined order: siblings are visited in code-unit order by
  * name, and a directory's own results appear where that directory sorts among
@@ -333,6 +333,19 @@ export async function findMarkdownFilesRecursive(
   options?: { maxDepth?: number }
 ): Promise<{ commandName: string; relativePath: string }[]> {
   return findMarkdownFilesRecursiveImpl(rootPath, relativePath, options, new Set<string>());
+}
+
+/** Discover executable commands in one scope: one folder deep, first name wins. */
+export async function findCommandFiles(
+  rootPath: string
+): ReturnType<typeof findMarkdownFilesRecursive> {
+  const entries = await findMarkdownFilesRecursive(rootPath, '', { maxDepth: 1 });
+  const seen = new Set<string>();
+  return entries.filter(({ commandName }) => {
+    if (seen.has(commandName)) return false;
+    seen.add(commandName);
+    return true;
+  });
 }
 
 function shouldSkipSymlinkTargetError(err: NodeJS.ErrnoException): boolean {
