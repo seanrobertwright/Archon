@@ -56,33 +56,41 @@ function repositoryInput(path: string): string | undefined {
   return packagesIndex === -1 ? undefined : normalized.slice(packagesIndex);
 }
 
+function buildImportGraph(entry: string, outdir: string): BuildMetafile {
+  const metafilePath = join(outdir, 'metafile.json');
+  const result = spawnSync(
+    process.execPath,
+    [
+      'build',
+      entry,
+      '--target=bun',
+      '--format=esm',
+      '--splitting',
+      `--outdir=${outdir}`,
+      `--metafile=${metafilePath}`,
+    ],
+    { cwd: repoRoot, encoding: 'utf8' }
+  );
+  if (result.status !== 0) {
+    throw new Error(`Import graph build failed for ${entry}:\n${result.stdout}\n${result.stderr}`);
+  }
+  return JSON.parse(readFileSync(metafilePath, 'utf8')) as BuildMetafile;
+}
+
 describe('CLI startup import boundary', () => {
   let buildDir: string;
   let metafile: BuildMetafile;
+  let handoffMetafile: BuildMetafile;
 
-  beforeAll(async () => {
+  beforeAll(() => {
     buildDir = mkdtempSync(join(tmpdir(), 'archon-cli-import-graph-'));
-    const metafilePath = join(buildDir, 'metafile.json');
-    const result = spawnSync(
-      process.execPath,
-      [
-        'build',
-        CLI_ENTRY,
-        '--target=bun',
-        '--format=esm',
-        '--splitting',
-        `--outdir=${buildDir}`,
-        `--metafile=${metafilePath}`,
-      ],
-      {
-        cwd: repoRoot,
-        encoding: 'utf8',
-      }
+    metafile = buildImportGraph(CLI_ENTRY, join(buildDir, 'cli'));
+    // Shared chunks can include unrelated CLI inputs as Bun's splitting changes.
+    // An isolated entrypoint measures the decoder's own dependency boundary.
+    handoffMetafile = buildImportGraph(
+      join(repoRoot, 'packages/core/src/config/run-config-handoff.ts'),
+      join(buildDir, 'handoff')
     );
-    if (result.status !== 0) {
-      throw new Error(`CLI graph build failed:\n${result.stdout}\n${result.stderr}`);
-    }
-    metafile = JSON.parse(readFileSync(metafilePath, 'utf8')) as BuildMetafile;
   });
 
   afterAll(async () => {
@@ -110,16 +118,10 @@ describe('CLI startup import boundary', () => {
   });
 
   it('keeps detached handoff decoding on its audited schema, crypto, and path leaves', () => {
-    const decoderChunk = Object.entries(metafile.outputs).find(([, output]) =>
-      Object.keys(output.inputs).some(input =>
-        input.replaceAll('\\', '/').endsWith('packages/core/src/config/run-config-handoff.ts')
-      )
-    )?.[0];
-    expect(decoderChunk).toBeDefined();
-
-    const internalInputs = staticallyReachableInputs(metafile, decoderChunk ?? '')
+    const internalInputs = Object.keys(handoffMetafile.inputs)
       .map(repositoryInput)
-      .filter((input): input is string => input !== undefined);
+      .filter((input): input is string => input !== undefined)
+      .sort();
     expect(internalInputs).toEqual([
       'packages/core/src/config/run-config-handoff.ts',
       'packages/core/src/utils/token-crypto.ts',
