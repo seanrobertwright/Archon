@@ -936,18 +936,20 @@ before removing it. Accepts multiple branch names in one call.
 
 ### `serve`
 
-Start the web UI server. On first run, downloads a pre-built web UI tarball from the matching GitHub release, verifies the SHA-256 checksum, and extracts it. Subsequent runs use the cached copy.
+Start the web UI server in the foreground. The same command works from a binary install and from a source checkout. Only the source of the web UI differs.
 
-**Binary installs only** — in development, use `bun run dev` instead.
+**Binary installs** download a pre-built web UI tarball from the matching GitHub release on first run, verify its SHA-256 checksum, and extract it. Later runs use the cached copy.
+
+**Source checkouts** serve the web UI you build yourself, at `packages/web/dist`. Run `bun run build:web` from the repo root before your first `archon serve`, and again after frontend changes. Nothing is downloaded, so `--download-only` is refused, and a missing build stops the command with the build command to run instead of serving an empty page.
 
 ```bash
-# Start web UI server (downloads on first run)
+# Start web UI server (binary installs download it on first run)
 archon serve
 
 # Override the default port
 archon serve --port 4000
 
-# Download the web UI without starting the server
+# Download the web UI without starting the server (binary installs only)
 archon serve --download-only
 ```
 
@@ -956,9 +958,9 @@ archon serve --download-only
 | Flag | Effect |
 |------|--------|
 | `--port <port>` | Override server port (default: 3090, range: 1–65535) |
-| `--download-only` | Download and cache the web UI, then exit without starting the server |
+| `--download-only` | Download and cache the web UI, then exit without starting the server. Binary installs only |
 
-The cached web UI is stored at `~/.archon/web-dist/<version>/`. Each version is cached independently, so upgrading the binary automatically downloads the matching web UI.
+The downloaded web UI is cached at `~/.archon/web-dist/<version>/`. Each version is cached independently, so upgrading the binary automatically downloads the matching web UI.
 
 ### `skill install [path]`
 
