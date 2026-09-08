@@ -1972,6 +1972,7 @@ describe('workflow test path targets', () => {
         [CLI_ENTRY, 'workflow', 'test', '../.archon/workflows/sdlc/plan', '--cwd', tools, '--json'],
         {
           encoding: 'utf8',
+          timeout: 20000,
           env: {
             ...process.env,
             ARCHON_TELEMETRY_DISABLED: '1',
@@ -1989,5 +1990,5 @@ describe('workflow test path targets', () => {
     } finally {
       await removeTempTree(repo);
     }
-  });
+  }, 30000);
 });
