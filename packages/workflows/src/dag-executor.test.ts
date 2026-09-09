@@ -786,7 +786,7 @@ describe('resolvedBodyNodes', () => {
 });
 
 describe('checkTriggerRule', () => {
-  it('returns skip provenance for every rule without changing eligibility', () => {
+  it('returns eligibility and skip provenance for every rule', () => {
     const completed = makeOutput('completed');
     const failed = makeOutput('failed');
     const conditionSkipped: NodeOutput = {
@@ -863,7 +863,7 @@ describe('checkTriggerRule', () => {
           ['left', completed],
           ['right', failureSkipped],
         ]),
-        expected: { decision: 'run' },
+        expected: { decision: 'skip', cause: { kind: 'upstream_failed', origin: 'validate' } },
       },
       {
         current: node('join', ['left', 'right'], {
@@ -17787,8 +17787,8 @@ describe('executeDagWorkflow -- exec timeout outcomes', () => {
         id: 'consumer',
         script: 'console.log(process.env.INPUTS_VALUE)',
         runtime: 'bun',
-        depends_on: ['slow'],
-        trigger_rule: 'all_done',
+        depends_on: ['slow', 'ready'],
+        trigger_rule: 'none_failed_min_one_success',
         with: { value: { from: '$slow.output', if_skipped: 'fallback' } },
       });
 
@@ -17800,7 +17800,11 @@ describe('executeDagWorkflow -- exec timeout outcomes', () => {
             workflowRun,
             workflow: {
               name: `exec-timeout-${kind}`,
-              nodes: [dagNodeSchema.parse(producerInput), consumer],
+              nodes: [
+                dagNodeSchema.parse({ id: 'ready', bash: 'echo ready' }),
+                dagNodeSchema.parse(producerInput),
+                consumer,
+              ],
             },
           })
         );
@@ -25979,6 +25983,140 @@ describe('executeDagWorkflow -- flattened include expansion', () => {
       origin: 'gate',
     });
   });
+
+  it.each(['failed', 'condition'] as const)(
+    '#3156: honors %s skip provenance through direct joins, include boundaries, and resume',
+    async mode => {
+      const deliver = {
+        ...buildWf('deliver-block', [
+          {
+            id: 'gate-validated',
+            bash: 'exit 1',
+            ...(mode === 'condition' ? { when: 'false' } : {}),
+          },
+          { id: 'checks', bash: 'echo checks', depends_on: ['gate-validated'] },
+          { id: 'result', bash: 'echo delivered', depends_on: ['checks'] },
+        ]),
+        returns: 'result',
+      };
+      const action = buildWf('action-block', [
+        { id: 'entry', bash: 'echo entry' },
+        { id: 'tail', bash: 'echo tail', depends_on: ['entry'], trigger_rule: 'all_done' },
+      ]);
+      const parent = buildWf('direct-joins', [
+        { id: 'pr', bash: 'printf ready' },
+        { id: 'deliver', include: 'deliver-block', depends_on: ['pr'] },
+        {
+          id: 'flip-ready',
+          script: 'console.log(process.env.INPUTS_DELIVERED)',
+          runtime: 'bun',
+          depends_on: ['pr', 'deliver'],
+          trigger_rule: 'none_failed_min_one_success',
+          with: { delivered: { from: '$deliver.output', if_skipped: 'fallback' } },
+        },
+        {
+          id: 'action',
+          include: 'action-block',
+          depends_on: ['pr', 'deliver'],
+          trigger_rule: 'none_failed_min_one_success',
+        },
+        {
+          id: 'report',
+          script: 'console.log(process.env.INPUTS_DELIVERED)',
+          runtime: 'bun',
+          depends_on: ['pr', 'deliver'],
+          trigger_rule: 'all_done',
+          with: { delivered: { from: '$deliver.output', if_skipped: 'fallback' } },
+        },
+      ]);
+      const expanded = expandWorkflowIncludes(
+        new Map([
+          ['deliver-block', deliver],
+          ['action-block', action],
+          ['direct-joins', parent],
+        ])
+      );
+      expect(expanded.errors).toEqual([]);
+      const workflow = expanded.workflows.get('direct-joins');
+      if (!workflow) throw new Error('direct-joins did not expand');
+      const nodes = [...workflow.nodes];
+      const initial = await executeExpanded(nodes, `direct-joins-${mode}`);
+      const resumed = await executeExpanded(
+        nodes,
+        `direct-joins-${mode}-resumed`,
+        new Map([['pr', { output: 'ready' }]])
+      );
+      const dryRun = await dryRunWorkflow({
+        workflow,
+        userMessage: '',
+        cwd: testDir,
+        stubs: {
+          pr: 'ready',
+          'flip-ready': 'fallback',
+          report: 'fallback',
+          action__entry: 'entry',
+          action__tail: 'tail',
+        },
+      });
+      const cause = {
+        kind: mode === 'failed' ? 'upstream_failed' : 'upstream_skipped',
+        origin: 'deliver__gate-validated',
+      };
+      const runs = [initial, resumed];
+      if (mode === 'failed') {
+        runs.push(
+          await executeExpanded(
+            nodes,
+            'direct-joins-cached-before-upgrade',
+            new Map([
+              ['pr', { output: 'ready' }],
+              ['flip-ready', { output: 'previously flipped' }],
+              ['action__entry', { output: 'entry' }],
+              ['action__tail', { output: 'tail' }],
+            ])
+          )
+        );
+      }
+      for (const run of runs) {
+        for (const id of ['deliver__checks', 'deliver__result']) {
+          expect(
+            run.events.find(event => event.step_name === id && event.event_type === 'node_skipped')
+              ?.data?.cause
+          ).toEqual(cause);
+        }
+        for (const id of ['flip-ready', 'action__entry', 'action__tail']) {
+          if (mode === 'failed') {
+            expect(
+              run.events.find(
+                event => event.step_name === id && event.event_type === 'node_skipped'
+              )?.data?.cause
+            ).toEqual(cause);
+            expect(
+              run.events.some(
+                event => event.step_name === id && event.event_type === 'node_started'
+              )
+            ).toBe(false);
+          } else {
+            expect(
+              run.events.some(
+                event => event.step_name === id && event.event_type === 'node_completed'
+              )
+            ).toBe(true);
+          }
+        }
+        expect(
+          run.events.find(
+            event => event.step_name === 'report' && event.event_type === 'node_completed'
+          )?.data?.node_output
+        ).toContain('fallback');
+      }
+      for (const id of ['flip-ready', 'action__entry', 'action__tail']) {
+        expect(dryRun.trace.find(entry => entry.nodeId === id)).toMatchObject(
+          mode === 'failed' ? { state: 'skipped', cause } : { state: 'stubbed' }
+        );
+      }
+    }
+  );
 
   it('recomputes the same skip provenance on resume', async () => {
     const nodes = expandedGatedParentNodes('skipped-dependency');
