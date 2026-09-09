@@ -2012,7 +2012,11 @@ function checkTriggerRuleForDependencies(
       blocking = upstreams.some(upstream => upstream.output.state === 'completed') ? [] : upstreams;
       break;
     case 'none_failed_min_one_success': {
-      const failed = upstreams.filter(upstream => upstream.output.state === 'failed');
+      const failed = upstreams.filter(
+        upstream =>
+          upstream.output.state === 'failed' ||
+          (upstream.output.state === 'skipped' && upstream.output.cause.kind === 'upstream_failed')
+      );
       const anySucceeded = upstreams.some(upstream => upstream.output.state === 'completed');
       blocking = failed.length > 0 ? failed : anySucceeded ? [] : upstreams;
       break;
@@ -10190,7 +10194,13 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                     );
                   });
                 // falls through to re-execute the node
-              } else if (composedBoundaryDecision.decision === 'run') {
+              } else if (
+                composedBoundaryDecision.decision === 'run' &&
+                // A join cached before failure-cascade skips blocked this rule must
+                // satisfy its current eligibility before that success can be reused.
+                (node.trigger_rule !== 'none_failed_min_one_success' ||
+                  checkTriggerRule(node, ctx.nodeOutputs).decision === 'run')
+              ) {
                 // #2402 — a cached prior-success skip is only safe when every
                 // dependency's current value still matches the prior snapshot.
                 // If any dep re-ran during this resume (e.g. an `always_run: true`

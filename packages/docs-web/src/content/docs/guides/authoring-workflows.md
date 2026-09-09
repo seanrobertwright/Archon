@@ -187,7 +187,7 @@ nodes:
   - id: implement
     command: implement-changes
     depends_on: [investigate, plan]
-    trigger_rule: none_failed_min_one_success  # Run if at least one dep succeeded
+    trigger_rule: none_failed_min_one_success  # Join successful and condition-skipped branches
 
   - id: inline-node
     prompt: "Summarize the changes made in $implement.output"  # Inline prompt (no command file)
@@ -402,8 +402,17 @@ nodes:
 |-------|----------|
 | `all_success` | Run only if all upstream deps completed successfully (default) |
 | `one_success` | Run if at least one upstream dep completed successfully |
-| `none_failed_min_one_success` | Run if no deps failed AND at least one succeeded (skipped deps are ok) |
+| `none_failed_min_one_success` | Run if at least one dependency succeeded and none failed or skipped because of an upstream failure (`upstream_failed`) |
 | `all_done` | Run when all deps are in a terminal state (completed, failed, or skipped) |
+
+`none_failed_min_one_success` blocks failure-cascade skips by default, including
+across dependency chains and includes. The skipped join retains the original failed
+node in its `upstream_failed` cause. Condition skips and optional timeout
+skips (`on_timeout: skip`) remain admissible when another dependency succeeds.
+
+`all_success`, `one_success`, and `all_done` keep their existing behavior.
+`if_skipped` supplies a value for a skipped output binding; it does not make a
+blocked node eligible to run or permit binding a failed output.
 
 :::note[`trigger_rule` is not `fan_out.join`]
 They share value names and have **different defaults**, so it is worth keeping straight:
